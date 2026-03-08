@@ -95,7 +95,8 @@ def poisson_deviance(
     mu = np.clip(mu, 1e-10, None)
 
     # Handle y=0 (0*log(0) = 0 by convention)
-    log_ratio = np.where(y > 0, y * np.log(y / mu), 0.0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        log_ratio = np.where(y > 0, y * np.log(y / mu), 0.0)
     dev = 2.0 * (log_ratio - (y - mu))
 
     if weights is not None:
@@ -148,7 +149,8 @@ def negbinom_deviance(
     mu = np.clip(mu, 1e-10, None)
     r = np.clip(r, 1e-10, None)
 
-    log_y_mu = np.where(y > 0, y * np.log(y / mu), 0.0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        log_y_mu = np.where(y > 0, y * np.log(y / mu), 0.0)
     dev = 2.0 * (log_y_mu - (y + r) * np.log((y + r) / (mu + r)))
 
     if weights is not None:
@@ -309,6 +311,8 @@ def gini_index(
     y_lorenz = cum_y / total_y
 
     # Area under Lorenz curve via trapezoid rule
-    auc = float(np.trapz(y_lorenz, x_lorenz))
+    auc = float(np.trapezoid(y_lorenz, x_lorenz)) if hasattr(np, "trapezoid") else float(np.trapz(y_lorenz, x_lorenz))
     # Normalised Gini = 2*AUC - 1 (perfect model has AUC=1, random has AUC=0.5)
-    return 2.0 * auc - 1.0
+    # Insurance convention: sort low-to-high, Lorenz below diagonal -> AUC < 0.5
+    # Gini = 1 - 2*AUC (perfect discrimination: AUC=0, Gini=1)
+    return 1.0 - 2.0 * auc

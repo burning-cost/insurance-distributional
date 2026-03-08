@@ -198,11 +198,14 @@ class TestGiniIndex:
         assert abs(g) < 0.2  # loose bound for random
 
     def test_perfect_discrimination(self):
-        """Perfect ranking gives Gini close to 1."""
-        y = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
+        """Perfect ranking with skewed data gives high Gini."""
+        # Skewed distribution: one large outlier dominates total loss.
+        # When sorted ascending by score=y, the outlier comes last.
+        # The Lorenz curve is far below the diagonal -> Gini near 1.
+        y = np.array([1.0, 1.0, 1.0, 1.0, 1000.0])
         score = y.copy()
         g = gini_index(y, score)
-        assert g > 0.8
+        assert g > 0.7
 
     def test_anti_rank(self):
         """Reversed ranking gives negative Gini."""

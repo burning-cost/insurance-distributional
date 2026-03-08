@@ -199,14 +199,17 @@ class TestZIPPrediction:
         np.testing.assert_allclose(pred.variance, expected, rtol=1e-5)
 
     def test_variance_higher_with_higher_pi(self):
-        """More zero-inflation = more variance for same mu."""
-        lam = np.array([1.0, 1.0])
+        """At fixed observable mean mu, more zero-inflation = more variance.
+        
+        Var = (1-pi)*lam*(1+pi*lam). With mu = (1-pi)*lam fixed:
+        lam = mu/(1-pi), so Var = mu*(1 + pi*mu/(1-pi)) = mu + pi*mu^2/(1-pi).
+        This is increasing in pi for fixed mu.
+        """
+        mu = np.array([0.5, 0.5])  # fixed observable mean
         pi_low = np.array([0.1, 0.1])
         pi_high = np.array([0.5, 0.5])
-        mu_low = (1 - pi_low) * lam
-        mu_high = (1 - pi_high) * lam
-        p1 = DistributionalPrediction("zip", mu=mu_low, pi=pi_low)
-        p2 = DistributionalPrediction("zip", mu=mu_high, pi=pi_high)
+        p1 = DistributionalPrediction("zip", mu=mu, pi=pi_low)
+        p2 = DistributionalPrediction("zip", mu=mu, pi=pi_high)
         assert np.all(p2.variance > p1.variance)
 
     def test_sampling_shape(self):

@@ -17,9 +17,9 @@ E[Y|x] = (1-pi(x)) * lambda(x)   [the reported mean]
 Var[Y|x] = (1-pi(x))*lambda(x) + pi(x)*(1-pi(x))*lambda(x)^2
 
 Implementation follows the two-stage approach from So (2023, arXiv 2307.07771),
-specifically Scenario 2 (ZIPB2 — functionally unrelated mu and pi):
-1. Fit a Poisson GBM on non-zero observations to estimate lambda(x)
-2. Fit a logistic classifier on all observations to estimate pi(x)
+specifically Scenario 2 (ZIPB2 -- functionally unrelated mu and pi):
+1. Fit a Poisson GBM on all observations to estimate lambda(x)
+2. Fit a classifier on all observations to estimate pi(x) via EM soft labels
 
 The two-stage approach is simpler to implement correctly than the joint
 coordinate descent and gives comparable performance for most insurance datasets.
@@ -36,8 +36,6 @@ import logging
 from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
-from scipy.optimize import minimize_scalar
-from scipy.stats import poisson, bernoulli
 
 from .base import DistributionalGBM, _to_1d
 from .prediction import DistributionalPrediction
@@ -59,7 +57,7 @@ def _zip_log_likelihood(
 
     mask0 = y == 0
     if mask0.any():
-        # log(pi + (1-pi)*exp(-lam)) — numerically stable
+        # log(pi + (1-pi)*exp(-lam)) -- numerically stable
         pois_zero = np.exp(-lam[mask0])
         ll[mask0] = np.log(pi[mask0] + (1.0 - pi[mask0]) * pois_zero + 1e-12)
 
@@ -84,7 +82,7 @@ class ZIPGBM(DistributionalGBM):
 
     Jointly estimates:
     - lambda(x): Poisson rate via CatBoost Poisson loss
-    - pi(x): zero-inflation probability via CatBoost Logloss (logistic)
+    - pi(x): zero-inflation probability via CatBoost CrossEntropy (classifier)
 
     The predicted mean is mu = (1-pi)*lambda.
 
@@ -96,7 +94,7 @@ class ZIPGBM(DistributionalGBM):
     catboost_params_mu : dict, optional
         Parameters for the lambda (Poisson) model.
     catboost_params_phi : dict, optional
-        Parameters for the pi (logistic) model.
+        Parameters for the pi (classifier) model.
     random_state : int
 
     Examples
@@ -188,19 +186,14 @@ class ZIPGBM(DistributionalGBM):
         """
         Two-stage coordinate descent for ZIP.
 
-        Stage 1 — Lambda model:
+        Stage 1 -- Lambda model:
           Fit CatBoost Poisson regression on all observations.
-          The zero-inflation is handled implicitly: the Poisson model
-          will underfit the zero-heavy data, and the pi model captures
-          the residual zero probability.
+          EM-style weights: observations that are likely structural zeros
+          contribute less to the lambda estimate.
 
-        Stage 2 — Pi model:
-          Create binary labels: y_binary = 1 if the zero is "excess"
-          (i.e., the Poisson model assigns very low probability to observing
-          this many zeros), 0 otherwise.
-          Simpler alternative we use: fit logistic regression on whether
-          observation is zero. The pi model learns to separate structural
-          zeros from Poisson-distributed zeros.
+        Stage 2 -- Pi model:
+          Compute EM soft labels: P(structural zero | y_i, lam_hat_i, pi_cur_i).
+          Fit CatBoostClassifier with CrossEntropy loss on soft labels.
         """
         n = len(y)
         pi_cur = params["pi"]
@@ -216,12 +209,8 @@ class ZIPGBM(DistributionalGBM):
         else:
             baseline_lam = np.log(exposure)
 
-        # Use (1-pi_cur) as sample weight: observations likely to be structural
-        # zeros contribute less to lambda estimation.
-        # This is the E-step of the EM approach (Gu 2024).
+        # EM weight: P(not structural | y=0) -- zeros that could be Poisson zeros
         poisson_zero_prob = np.exp(-lam_cur)
-        # Probability that y_i=0 is from Poisson (not structural zero)
-        # P(not structural | y=0) = (1-pi)*pois_zero / (pi + (1-pi)*pois_zero)
         w_lambda = np.ones(n)
         mask0 = y == 0
         if mask0.any():
@@ -235,43 +224,75 @@ class ZIPGBM(DistributionalGBM):
         lam_hat = np.clip(lam_hat, 1e-6, None)
         params["lam"] = lam_hat
 
-        # --- Stage 2: Pi model (logistic on binary zero indicator) ---
-        # We model P(Y=0 is structural | x) via logistic regression.
-        # The "soft" label approach: for y=0, posterior probability of being
-        # structural zero. For y>0, label is 0 (definitely not structural).
+        # --- Stage 2: Pi model (classifier on soft EM labels) ---
+        # Soft label: P(structural zero | y_i, lam_hat_i, pi_cur_i)
+        # For y=0: pi / (pi + (1-pi)*exp(-lam))
+        # For y>0: 0  (definitely not structural)
         pi_labels = np.zeros(n)
         if mask0.any():
             pois_zero_new = np.exp(-lam_hat[mask0])
             denom2 = pi_cur[mask0] + (1.0 - pi_cur[mask0]) * pois_zero_new + 1e-12
             pi_labels[mask0] = pi_cur[mask0] / denom2
-        # Clip labels to valid range for Logloss
         pi_labels = np.clip(pi_labels, 1e-6, 1 - 1e-6)
 
         pi_params = self._merge_catboost_params(
-            self._default_catboost_params("Logloss", iterations=200),
+            {
+                "loss_function": "CrossEntropy",
+                "iterations": 200,
+                "learning_rate": 0.05,
+                "depth": 6,
+                "random_seed": self.random_state,
+                "verbose": False,
+                "allow_writing_files": False,
+            },
             self.catboost_params_phi,
         )
-        if cycle == 0:
-            init_logit = np.log(self._pi_init / (1.0 - self._pi_init + 1e-12))
-            baseline_pi = np.full(n, init_logit)
-        else:
-            baseline_pi = None
 
-        self._model_pi = self._fit_catboost(
-            X, pi_labels, pi_params, baseline=baseline_pi
+        self._model_pi = self._fit_catboost_classifier(
+            X, pi_labels, pi_params
         )
-        # CatBoost Logloss outputs probabilities
-        pi_hat = self._model_pi.predict(X)
+        pi_hat = self._predict_catboost_classifier(self._model_pi, X)
         pi_hat = np.clip(pi_hat, 1e-6, 1 - 1e-6)
         params["pi"] = pi_hat
 
         return params
 
+    def _fit_catboost_classifier(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        params: Dict[str, Any],
+    ):
+        """Fit a CatBoostClassifier for probability estimation."""
+        from catboost import CatBoostClassifier, Pool
+
+        pool_kwargs: Dict[str, Any] = {"data": X, "label": y}
+        if self.cat_features:
+            pool_kwargs["cat_features"] = self.cat_features
+
+        pool = Pool(**pool_kwargs)
+        model = CatBoostClassifier(**params)
+        model.fit(pool)
+        return model
+
+    def _predict_catboost_classifier(
+        self, model, X: np.ndarray
+    ) -> np.ndarray:
+        """Predict class 1 probability from CatBoostClassifier."""
+        from catboost import Pool
+        pool = Pool(data=X, cat_features=self.cat_features if self.cat_features else None)
+        # predict_proba returns (n, 2) array; take column 1 (P(class=1))
+        proba = model.predict_proba(pool)
+        return proba[:, 1]
+
     def _predict_params(
         self, X: np.ndarray, exposure: np.ndarray
     ) -> Dict[str, np.ndarray]:
         lam_hat = np.clip(self._model_lambda.predict(X), 1e-6, None)
-        pi_hat = np.clip(self._model_pi.predict(X), 1e-6, 1 - 1e-6)
+        pi_hat = np.clip(
+            self._predict_catboost_classifier(self._model_pi, X),
+            1e-6, 1 - 1e-6
+        )
         # Observable mean
         mu_hat = (1.0 - pi_hat) * lam_hat
         return {"mu": mu_hat, "lam": lam_hat, "pi": pi_hat}
@@ -290,7 +311,7 @@ class ZIPGBM(DistributionalGBM):
 
     def predict_lambda(
         self,
-        X: Union[np.ndarray, "pl.DataFrame"],
+        X: Union[np.ndarray, "pl.DataFrame"],  # type: ignore[name-defined]
         exposure: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """
