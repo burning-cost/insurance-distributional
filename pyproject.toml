@@ -1,0 +1,45 @@
+[project]
+name = "insurance-distributional"
+version = "0.1.0"
+description = "Distributional GBM for insurance pricing — Tweedie, ZIP, Gamma, Negative Binomial with CatBoost"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [
+    { name = "Burning Cost", email = "pricing.frontier@gmail.com" }
+]
+requires-python = ">=3.10"
+keywords = ["insurance", "actuarial", "gradient-boosting", "distributional", "tweedie", "catboost"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Financial and Insurance Industry",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Mathematics",
+]
+dependencies = [
+    "catboost>=1.2",
+    "numpy>=1.24",
+    "polars>=0.20",
+    "scipy>=1.10",
+]
+
+[project.optional-dependencies]
+plots = ["matplotlib>=3.6"]
+dev = ["pytest>=7.0", "pytest-cov", "numpy>=1.24", "polars>=0.20"]
+
+[project.urls]
+Homepage = "https://github.com/burningcost/insurance-distributional"
+Repository = "https://github.com/burningcost/insurance-distributional"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/insurance_distributional"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
