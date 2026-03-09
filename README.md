@@ -1,4 +1,5 @@
 # insurance-distributional
+[![Tests](https://github.com/burning-cost/insurance-distributional/actions/workflows/ci.yml/badge.svg)](https://github.com/burning-cost/insurance-distributional/actions/workflows/ci.yml)
 
 Distributional gradient boosting for insurance pricing. Models the full conditional distribution of losses — not just the mean.
 
