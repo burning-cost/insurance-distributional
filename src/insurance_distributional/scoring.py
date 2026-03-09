@@ -292,11 +292,12 @@ def gini_index(
         weights = np.ones(len(y))
     weights = np.asarray(weights, dtype=np.float64)
 
-    # Sort by predicted score descending — highest-risk first.
-    # Actuarial convention: a useful model concentrates losses at the top
-    # of the score ranking, so the Lorenz curve lies below the diagonal,
-    # AUC < 0.5, and Gini = 1 - 2*AUC > 0.
-    order = np.argsort(score)[::-1]
+    # Sort by predicted score ascending (low-risk first).
+    # For a useful model, high losses are concentrated at the high end, so the
+    # Lorenz curve lies below the diagonal (AUC < 0.5).
+    # Gini = 1 - 2*AUC: perfect discrimination -> AUC near 0 -> Gini near 1.
+    # Random model: AUC = 0.5 -> Gini = 0. Anti-rank: AUC > 0.5 -> Gini < 0.
+    order = np.argsort(score)
     y_sorted = y[order]
     w_sorted = weights[order]
 
@@ -315,6 +316,6 @@ def gini_index(
 
     # Area under Lorenz curve via trapezoid rule
     auc = float(np.trapezoid(y_lorenz, x_lorenz)) if hasattr(np, "trapezoid") else float(np.trapz(y_lorenz, x_lorenz))
-    # Gini = 1 - 2*AUC: when sorted high-to-low, a perfect model yields AUC=0
-    # (all losses in the first policy) -> Gini=1. Random model: AUC=0.5 -> Gini=0.
+    # Gini = 1 - 2*AUC: good model concentrates losses at high scores (end of
+    # ascending sort), Lorenz curve below diagonal, AUC < 0.5, Gini > 0.
     return 1.0 - 2.0 * auc
