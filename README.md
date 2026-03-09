@@ -1,13 +1,18 @@
 # insurance-distributional
 [![Tests](https://github.com/burning-cost/insurance-distributional/actions/workflows/ci.yml/badge.svg)](https://github.com/burning-cost/insurance-distributional/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/insurance-distributional)](https://pypi.org/project/insurance-distributional/)
+![Python](https://img.shields.io/badge/python-3.10%2B-blue)
+![License: MIT](https://img.shields.io/badge/license-MIT-green)
 
-Distributional gradient boosting for insurance pricing. Models the full conditional distribution of losses — not just the mean.
+Distributional gradient boosting for insurance pricing. Models the full conditional distribution of losses - not just the mean - so you get a coefficient of variation per risk, not just E[Y|x].
 
-Implements the ASTIN 2024 Best Paper approach (So & Valdez, arXiv 2406.16206) with CatBoost as the boosting engine. As of March 2026, no open-source implementation of this exists.
+Implements the ASTIN 2024 Best Paper approach (So & Valdez, arXiv 2406.16206) with CatBoost as the boosting engine. As of March 2026, no other open-source implementation of this exists.
+
+---
 
 ## The problem
 
-Standard GLMs and GBMs predict E[Y|x]. This is fine for pricing the average risk. But it tells you nothing about Var[Y|x] — the uncertainty around that prediction.
+Standard GLMs and GBMs predict E[Y|x]. This is fine for pricing the average risk. But it tells you nothing about Var[Y|x] - the uncertainty around that prediction.
 
 Two motor policies priced at £350 pure premium can have very different risk profiles:
 
@@ -16,7 +21,15 @@ Two motor policies priced at £350 pure premium can have very different risk pro
 
 The appropriate safety loading, reinsurance attachment, and capital allocation differ between A and B. A model that only outputs the mean treats them identically.
 
-Distributional GBM gives you both. You get `pred.mean` for the price and `pred.volatility_score()` for the uncertainty — a coefficient of variation per risk.
+Distributional GBM gives you both. You get `pred.mean` for the price and `pred.volatility_score()` for the uncertainty - a coefficient of variation per risk.
+
+---
+
+## Blog post
+
+[Your Technical Price Ignores Variance](https://burning-cost.github.io/2026/03/08/insurance-distributional/)
+
+---
 
 ## What is included
 
@@ -29,6 +42,8 @@ Four distribution classes, each following the same fit/predict interface:
 | `ZIPGBM` | Zero-Inflated Poisson | lambda, pi | Pet/travel/breakdown frequency |
 | `NegBinomialGBM` | Negative Binomial | mu, r | Overdispersed frequency |
 
+---
+
 ## Installation
 
 ```bash
@@ -36,6 +51,8 @@ pip install insurance-distributional
 ```
 
 Requires CatBoost, NumPy, Polars, SciPy.
+
+---
 
 ## Quick start
 
@@ -85,6 +102,8 @@ pred.variance  # mu + mu^2/r -- always > mu (unlike Poisson)
 pred.r         # overdispersion size parameter
 ```
 
+---
+
 ## Distribution parameter interpretation
 
 **Tweedie (mu, phi):**
@@ -106,6 +125,8 @@ pred.r         # overdispersion size parameter
 - `r`: size/overdispersion parameter. Var = mu + mu^2/r. As r -> inf, NB -> Poisson.
 - `r = 3` is typical for UK fleet motor.
 
+---
+
 ## Dispersion modelling
 
 By default, `TweedieGBM` and `GammaGBM` fit a GBM for the dispersion parameter using the Smyth-Jorgensen double GLM approach (ASTIN Bulletin 2002). The dispersion model fits on squared Pearson residuals:
@@ -122,6 +143,8 @@ To use a scalar dispersion (faster, less flexible):
 model = TweedieGBM(power=1.5, model_dispersion=False)
 ```
 
+---
+
 ## Actuarial uses of volatility_score()
 
 The volatility score (CoV per risk) is the key output beyond the mean. UK pricing teams use it for:
@@ -129,10 +152,12 @@ The volatility score (CoV per risk) is the key output beyond the mean. UK pricin
 1. **Safety loading**: P = mu * (1 + k * CoV) where k is the risk appetite parameter.
 2. **Underwriter referrals**: Flag risks where CoV exceeds a threshold.
 3. **Reinsurance**: Identify segments that drive tail exposure.
-4. **IFRS 17**: Risk adjustment is proportional to uncertainty -- CoV provides the input.
+4. **IFRS 17**: Risk adjustment is proportional to uncertainty - CoV provides the input.
 5. **Capital allocation**: High-CoV risks consume more SCR per unit of premium.
 
 No commercial pricing tool (Emblem, Radar, Guidewire) currently outputs CoV per risk. This library fills that gap.
+
+---
 
 ## Scoring utilities
 
@@ -158,6 +183,8 @@ gini_mean = gini_index(y_test, pred.mean)
 gini_vol = gini_index(y_test, pred.volatility_score())
 ```
 
+---
+
 ## CatBoost parameters
 
 Pass custom CatBoost parameters via `catboost_params_mu` and `catboost_params_phi`:
@@ -181,6 +208,8 @@ model = TweedieGBM(
 
 CatBoost's native handling of high-cardinality categoricals via ordered target statistics is the main reason we use CatBoost rather than XGBoost or LightGBM for UK personal lines data.
 
+---
+
 ## Design notes
 
 **Why separate models per parameter, not joint multi-output?** CatBoost's MultiTargetCustomObjective has sparse documentation and known GPU incompatibilities. Separate models are simpler, debuggable, and extensible. The statistical cost (no shared tree structure) is negligible.
@@ -189,9 +218,60 @@ CatBoost's native handling of high-cardinality categoricals via ordered target s
 
 **Why no PyTorch?** All four distributions have well-understood log-likelihoods that SciPy handles reliably. PyTorch adds 500MB+ to the install and is not needed. XGBoostLSS uses Pyro, which is overkill for actuarial use cases.
 
+---
+
 ## References
 
 - So & Valdez (2024). *Zero-Inflated Tweedie Boosted Trees with CatBoost for Insurance Loss Analytics*. Applied Soft Computing. doi:10.1016/j.asoc.2025.113226. arXiv 2406.16206. **ASTIN Best Paper 2024.**
 - Smyth & Jorgensen (2002). *Fitting Tweedie's Compound Poisson Model to Insurance Claims Data: Dispersion Modelling*. ASTIN Bulletin 32(1):143-157.
 - Chevalier & Cote (2025). *From point to probabilistic gradient boosting for claim frequency and severity prediction*. European Actuarial Journal. doi:10.1007/s13385-025-00428-5.
 - Rigby & Stasinopoulos (2005). *Generalized Additive Models for Location, Scale and Shape*. Journal of the Royal Statistical Society Series C, 54(3):507-554.
+
+---
+
+## Other Burning Cost libraries
+
+**Model building**
+
+| Library | Description |
+|---------|-------------|
+| [shap-relativities](https://github.com/burning-cost/shap-relativities) | Extract rating relativities from GBMs using SHAP |
+| [insurance-interactions](https://github.com/burning-cost/insurance-interactions) | Automated GLM interaction detection via CANN and NID scores |
+| [insurance-cv](https://github.com/burning-cost/insurance-cv) | Walk-forward cross-validation respecting IBNR structure |
+
+**Uncertainty quantification**
+
+| Library | Description |
+|---------|-------------|
+| [insurance-conformal](https://github.com/burning-cost/insurance-conformal) | Distribution-free prediction intervals for Tweedie models |
+| [bayesian-pricing](https://github.com/burning-cost/bayesian-pricing) | Hierarchical Bayesian models for thin-data segments |
+| [credibility](https://github.com/burning-cost/credibility) | Bühlmann-Straub credibility weighting |
+
+**Deployment and optimisation**
+
+| Library | Description |
+|---------|-------------|
+| [rate-optimiser](https://github.com/burning-cost/rate-optimiser) | Constrained rate change optimisation with FCA PS21/5 compliance |
+| [insurance-demand](https://github.com/burning-cost/insurance-demand) | Conversion, retention, and price elasticity modelling |
+
+**Governance**
+
+| Library | Description |
+|---------|-------------|
+| [insurance-fairness](https://github.com/burning-cost/insurance-fairness) | Proxy discrimination auditing for UK insurance models |
+| [insurance-causal](https://github.com/burning-cost/insurance-causal) | Double Machine Learning for causal pricing inference |
+| [insurance-monitoring](https://github.com/burning-cost/insurance-monitoring) | Model monitoring: PSI, A/E ratios, Gini drift test |
+
+**Spatial**
+
+| Library | Description |
+|---------|-------------|
+| [insurance-spatial](https://github.com/burning-cost/insurance-spatial) | BYM2 spatial territory ratemaking for UK personal lines |
+
+[All libraries](https://burning-cost.github.io)
+
+---
+
+## Licence
+
+MIT
