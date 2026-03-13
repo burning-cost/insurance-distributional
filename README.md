@@ -57,8 +57,47 @@ Requires CatBoost, NumPy, Polars, SciPy.
 ## Quick start
 
 ```python
-from insurance_distributional import TweedieGBM
 import numpy as np
+from insurance_distributional import TweedieGBM
+
+rng = np.random.default_rng(42)
+n = 1000
+
+# Synthetic UK motor portfolio
+vehicle_age = rng.integers(0, 15, n).astype(float)
+driver_age = rng.integers(18, 75, n).astype(float)
+ncd_years = rng.integers(0, 5, n).astype(float)
+vehicle_group = rng.integers(1, 6, n).astype(float)  # 1=small, 5=prestige
+
+X = np.column_stack([vehicle_age, driver_age, ncd_years, vehicle_group])
+
+# True mu: Tweedie with covariate-dependent dispersion
+log_mu = (
+    5.0
+    + 0.02 * np.maximum(30 - driver_age, 0)
+    + 0.05 * vehicle_age
+    - 0.10 * ncd_years
+    + 0.08 * vehicle_group
+)
+mu_true = np.exp(log_mu)
+phi_true = 0.5 + 0.02 * vehicle_age  # older vehicles -> more dispersed losses
+
+# Simulate Tweedie (compound Poisson-Gamma) outcomes
+# Approximate via: Poisson frequency * Gamma severity
+lam = mu_true ** (2 - 1.5) / (phi_true * (2 - 1.5))  # Poisson parameter
+counts = rng.poisson(lam)
+gamma_scale = mu_true / lam  # severity scale
+y = np.array([
+    rng.gamma(c, gamma_scale[i]) if c > 0 else 0.0
+    for i, c in enumerate(counts)
+])
+exposure = rng.uniform(0.5, 1.0, n)
+
+# 80/20 split
+n_train = int(0.8 * n)
+X_train, X_test = X[:n_train], X[n_train:]
+y_train, y_test = y[:n_train], y[n_train:]
+exposure_train, exposure_test = exposure[:n_train], exposure[n_train:]
 
 # Motor pure premium -- Tweedie compound Poisson-Gamma
 model = TweedieGBM(power=1.5)
@@ -166,6 +205,8 @@ from insurance_distributional import (
     tweedie_deviance, poisson_deviance, gamma_deviance,
     coverage, pit_values, pearson_residuals, gini_index,
 )
+
+# pred is from model.predict(X_test, exposure=exposure_test) as shown above
 
 # Standard actuarial deviance metrics
 tweedie_deviance(y_test, pred.mean, power=1.5)
