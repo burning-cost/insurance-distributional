@@ -19,17 +19,17 @@ classifiers = [
 dependencies = [
     "catboost>=1.2",
     "numpy>=1.24",
-    "polars>=0.20",
+    "polars>=1.0",
     "scipy>=1.10",
 ]
 
 [project.optional-dependencies]
 plots = ["matplotlib>=3.6"]
-dev = ["pytest>=7.0", "pytest-cov", "numpy>=1.24", "polars>=0.20"]
+dev = ["pytest>=7.0", "pytest-cov", "numpy>=1.24", "polars>=1.0"]
 
 [project.urls]
-Homepage = "https://github.com/burningcost/insurance-distributional"
-Repository = "https://github.com/burningcost/insurance-distributional"
+Homepage = "https://github.com/burning-cost/insurance-distributional"
+Repository = "https://github.com/burning-cost/insurance-distributional"
 
 [build-system]
 requires = ["hatchling"]
