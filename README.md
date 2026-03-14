@@ -387,6 +387,15 @@ Safety loading spread: the distributional model (per-risk phi) produces a 40–6
 
 ---
 
+
+## Related Libraries
+
+| Library | What it does |
+|---------|-------------|
+| [insurance-distributional-glm](https://github.com/burning-cost/insurance-distributional-glm) | GAMLSS — extends distributional modelling to let sigma and shape depend on covariates, not just the mean |
+| [insurance-conformal](https://github.com/burning-cost/insurance-conformal) | Conformal prediction — distribution-free alternative when parametric assumptions cannot be verified |
+| [insurance-quantile](https://github.com/burning-cost/insurance-quantile) | Quantile GBM for tail risk — non-parametric alternative for heteroskedastic severity |
+
 ## Licence
 
 MIT
