@@ -117,25 +117,74 @@ model.log_score(X_test, y_test)  # negative log-likelihood
 ```
 
 ```python
+import numpy as np
 from insurance_distributional import ZIPGBM
 
-# Pet insurance frequency -- Zero-Inflated Poisson
+# Synthetic pet insurance frequency — Zero-Inflated Poisson
+# Many pets never claim in a year (structural zeros)
+rng_zip = np.random.default_rng(7)
+n_zip = 800
+
+pet_age    = rng_zip.integers(0, 15, n_zip).astype(float)
+breed_risk = rng_zip.integers(1, 5, n_zip).astype(float)  # 1=low, 4=high
+vet_cover  = rng_zip.uniform(2_000, 10_000, n_zip)         # excess level
+
+X_zip = np.column_stack([pet_age, breed_risk, vet_cover])
+
+# True DGP: 55% structural zeros, rest Poisson(0.4 + 0.05*breed_risk)
+pi_true  = 0.55
+lam_true = 0.40 + 0.05 * breed_risk
+y_zip = np.where(
+    rng_zip.random(n_zip) < pi_true,
+    0,
+    rng_zip.poisson(lam_true),
+).astype(float)
+
+n_tr = int(0.8 * n_zip)
+X_zip_train, X_zip_test = X_zip[:n_tr], X_zip[n_tr:]
+y_zip_train = y_zip[:n_tr]
+
 model = ZIPGBM()
-model.fit(X_train, y_train)
-pred = model.predict(X_test)
+model.fit(X_zip_train, y_zip_train)
+pred = model.predict(X_zip_test)
 
 pred.mu              # observable mean = (1-pi)*lambda
 pred.pi              # structural zero probability per risk
-model.predict_lambda(X_test)  # underlying Poisson rate
+model.predict_lambda(X_zip_test)  # underlying Poisson rate
 ```
 
 ```python
+import numpy as np
 from insurance_distributional import NegBinomialGBM
+
+# Synthetic fleet motor frequency — Negative Binomial (overdispersed)
+# Fleet vehicles have heterogeneous latent risk not captured by rating factors
+rng_nb = np.random.default_rng(99)
+n_nb = 600
+
+vehicle_age_nb = rng_nb.integers(1, 10, n_nb).astype(float)
+fleet_size     = rng_nb.integers(5, 50, n_nb).astype(float)   # fleet vehicles
+annual_miles   = rng_nb.uniform(15_000, 80_000, n_nb)
+
+X_nb = np.column_stack([vehicle_age_nb, fleet_size, annual_miles / 10_000])
+exposure_nb = rng_nb.uniform(0.5, 1.0, n_nb)  # vehicle-years
+
+# True DGP: NB with mu=0.12 per vehicle-year, r=3 (typical UK fleet)
+mu_true_nb = 0.12 * exposure_nb
+r_true     = 3.0
+p_nb = r_true / (r_true + mu_true_nb)
+y_nb = rng_nb.negative_binomial(r_true, p_nb).astype(float)
+
+n_tr_nb = int(0.8 * n_nb)
+X_nb_train, X_nb_test = X_nb[:n_tr_nb], X_nb[n_tr_nb:]
+y_nb_train = y_nb[:n_tr_nb]
+exp_nb_train = exposure_nb[:n_tr_nb]
+exp_nb_test  = exposure_nb[n_tr_nb:]
 
 # Overdispersed frequency (fleet motor)
 model = NegBinomialGBM()
-model.fit(X_train, y_train, exposure=exposure_train)
-pred = model.predict(X_test)
+model.fit(X_nb_train, y_nb_train, exposure=exp_nb_train)
+pred = model.predict(X_nb_test)
 
 pred.variance  # mu + mu^2/r -- always > mu (unlike Poisson)
 pred.r         # overdispersion size parameter
