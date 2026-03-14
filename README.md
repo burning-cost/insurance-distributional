@@ -344,6 +344,11 @@ Safety loading spread: the distributional model (per-risk phi) produces a 40–6
 
 ---
 
+
+## Databricks Notebook
+
+A ready-to-run Databricks notebook benchmarking this library against standard approaches is available in [burning-cost-examples](https://github.com/burning-cost/burning-cost-examples/blob/main/notebooks/insurance_distributional_demo.py).
+
 ## Other Burning Cost libraries
 
 **Model building**
