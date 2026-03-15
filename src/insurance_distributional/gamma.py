@@ -23,6 +23,7 @@ variation squared.
 from __future__ import annotations
 
 import logging
+import warnings
 from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
@@ -60,13 +61,35 @@ def _estimate_phi_gamma_mle(y: np.ndarray, mu: np.ndarray) -> float:
     """
     Estimate scalar phi (= 1/shape) by MLE given fixed mu.
     phi = 1/(shape) is the Gamma dispersion parameter.
+
+    P1-5 fix: emits a warning if the optimum lands at either search boundary
+    (log_phi in {-5, 3}), indicating the true phi may be outside the range.
     """
+    lo, hi = -5.0, 3.0
+
     def neg_ll(log_phi: float) -> float:
         phi_val = np.exp(log_phi)
         phi_arr = np.full(len(y), phi_val)
         return -np.sum(_gamma_log_likelihood(y, mu, phi_arr))
 
-    result = minimize_scalar(neg_ll, bounds=(-5, 3), method="bounded")
+    result = minimize_scalar(neg_ll, bounds=(lo, hi), method="bounded")
+    # P1-5: warn if optimum is at a boundary
+    if abs(result.x - lo) < 1e-4:
+        warnings.warn(
+            f"Gamma phi MLE hit lower bound (log_phi={lo}); "
+            f"true phi may be < {np.exp(lo):.4f}. "
+            "Very low dispersion — consider inspecting the data.",
+            UserWarning,
+            stacklevel=2,
+        )
+    elif abs(result.x - hi) < 1e-4:
+        warnings.warn(
+            f"Gamma phi MLE hit upper bound (log_phi={hi}); "
+            f"true phi may be > {np.exp(hi):.3f}. "
+            "High dispersion — consider inspecting the data.",
+            UserWarning,
+            stacklevel=2,
+        )
     return float(np.exp(result.x))
 
 
@@ -171,7 +194,9 @@ class GammaGBM(DistributionalGBM):
         if cycle == 0:
             baseline_mu = np.full(len(y), np.log(params["mu_init"]))
         else:
-            baseline_mu = np.zeros(len(y))
+            # P1-4 fix: use log of the previous cycle's mu estimate so that
+            # coordinate descent refines rather than restarting from zero.
+            baseline_mu = np.log(np.clip(params["mu"], 1e-6, None))
 
         self._model_mu = self._fit_catboost(
             X, y, mu_params, baseline=baseline_mu

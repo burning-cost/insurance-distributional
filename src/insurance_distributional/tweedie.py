@@ -26,6 +26,7 @@ dispersion residuals for the phi model.
 from __future__ import annotations
 
 import logging
+import warnings
 from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
@@ -88,13 +89,36 @@ def _estimate_phi_mle(y: np.ndarray, mu: np.ndarray, p: float) -> float:
 
     Minimises -sum(log_likelihood) over phi > 0.
     Used for unconditional initialisation.
+
+    P1-5 fix: emits a warning if the optimum lands at either search boundary
+    (log_phi in {-3, 3}), which indicates the true phi may be outside the
+    search range and the estimate is unreliable.
     """
+    lo, hi = -3.0, 3.0
+
     def neg_ll(log_phi: float) -> float:
         phi_val = np.exp(log_phi)
         phi_arr = np.full(len(y), phi_val)
         return -np.sum(_tweedie_log_likelihood(y, mu, phi_arr, p))
 
-    result = minimize_scalar(neg_ll, bounds=(-3, 3), method="bounded")
+    result = minimize_scalar(neg_ll, bounds=(lo, hi), method="bounded")
+    # P1-5: warn if optimum is at a boundary
+    if abs(result.x - lo) < 1e-4:
+        warnings.warn(
+            f"Tweedie phi MLE hit lower bound (log_phi={lo}); "
+            f"true phi may be < {np.exp(lo):.3f}. "
+            "Consider narrowing the search bounds or inspecting the data.",
+            UserWarning,
+            stacklevel=2,
+        )
+    elif abs(result.x - hi) < 1e-4:
+        warnings.warn(
+            f"Tweedie phi MLE hit upper bound (log_phi={hi}); "
+            f"true phi may be > {np.exp(hi):.3f}. "
+            "Consider narrowing the search bounds or inspecting the data.",
+            UserWarning,
+            stacklevel=2,
+        )
     return float(np.exp(result.x))
 
 
@@ -222,13 +246,13 @@ class TweedieGBM(DistributionalGBM):
         )
         # CatBoost Tweedie with baseline = log(exposure) + log(mu_init)
         # On first cycle, bootstrap from unconditional estimate.
-        # On subsequent cycles, residualise from previous mu.
+        # P1-4 fix: on subsequent cycles, include the previous cycle's mu
+        # estimate in the baseline so coordinate descent actually refines the
+        # previous fit rather than discarding it.
         if cycle == 0:
             baseline_mu = np.log(exposure) + np.log(params["mu_init"])
         else:
-            # Subtract existing mu prediction to get residuals; CatBoost
-            # then refines the prediction. We use raw log-scale residuals.
-            baseline_mu = np.log(exposure)
+            baseline_mu = np.log(params["mu"]) + np.log(exposure)
 
         self._model_mu = self._fit_catboost(
             X, y, mu_params, baseline=baseline_mu
@@ -274,7 +298,14 @@ class TweedieGBM(DistributionalGBM):
     def _predict_params(
         self, X: np.ndarray, exposure: np.ndarray
     ) -> Dict[str, np.ndarray]:
-        mu_hat = self._model_mu.predict(X)
+        # P0-1 fix: apply log(exposure) as baseline so predictions are on the
+        # correct scale. The model was trained with baseline = log(exposure) +
+        # log(mu_init), meaning exp(f(x)) is the rate per unit exposure.
+        # At prediction time we must add log(exposure) back so we get the
+        # absolute mean (rate * exposure) rather than just the rate.
+        mu_hat = self._predict_catboost(
+            self._model_mu, X, baseline=np.log(exposure)
+        )
         mu_hat = np.clip(mu_hat, 1e-6, None)
 
         if self.model_dispersion and self._model_phi is not None:

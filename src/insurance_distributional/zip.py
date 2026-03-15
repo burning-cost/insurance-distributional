@@ -140,15 +140,21 @@ class ZIPGBM(DistributionalGBM):
 
         pi_init: method-of-moments from excess zeros.
           Observed zero rate = pi + (1-pi)*exp(-lam)
-          Standard Poisson rate from non-zeros = mean(y[y>0]).
+          Use the overall exposure-weighted rate as lam estimate.
 
-        lam_init: mean of non-zero observations (rate per unit exposure).
+        lam_init: overall exposure-weighted rate sum(y)/sum(exposure).
+
+        P0-2 fix: the original code used mean(y[y>0]) as lam_nonzero, which
+        is E[Y|Y>0] = lambda/(1-exp(-lambda)) — a 2-4x overestimate for small
+        lambda. The correct initialisation is the unconditional rate
+        sum(y)/sum(exposure), which accounts for structural zeros.
         """
         n = len(y)
         n_zeros = int(np.sum(y == 0))
         obs_zero_rate = n_zeros / n
 
-        lam_nonzero = float(np.mean(y[y > 0])) if np.any(y > 0) else 0.1
+        # P0-2 fix: use overall exposure-weighted rate, not E[Y|Y>0]
+        lam_nonzero = float(np.sum(y) / np.sum(exposure)) if np.sum(exposure) > 0 else 0.1
         lam_nonzero = max(lam_nonzero, 1e-4)
 
         # Poisson zero probability at lam_nonzero
@@ -207,7 +213,9 @@ class ZIPGBM(DistributionalGBM):
         if cycle == 0:
             baseline_lam = np.log(exposure) + np.log(self._lam_init)
         else:
-            baseline_lam = np.log(exposure)
+            # P1-4 fix: use previous cycle's lambda estimate in the baseline
+            # so coordinate descent refines rather than restarts from scratch.
+            baseline_lam = np.log(params["lam"]) + np.log(exposure)
 
         # EM weight: P(not structural | y=0) -- zeros that could be Poisson zeros
         poisson_zero_prob = np.exp(-lam_cur)

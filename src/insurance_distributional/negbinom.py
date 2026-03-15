@@ -30,6 +30,7 @@ a scalar r (standard NB with heterogeneous mean only).
 from __future__ import annotations
 
 import logging
+import warnings
 from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
@@ -66,13 +67,35 @@ def _estimate_r_mle(y: np.ndarray, mu: np.ndarray) -> float:
     Estimate scalar r by MLE given fixed mu.
 
     Optimises over log(r) for numerical stability.
+
+    P1-5 fix: emits a warning if the optimum lands at either boundary of
+    the search range, indicating the true r may be outside the range searched.
     """
+    lo, hi = -2.0, 8.0
+
     def neg_ll(log_r: float) -> float:
         r_val = np.exp(log_r)
         r_arr = np.full(len(y), r_val)
         return -np.sum(_negbinom_log_likelihood(y, mu, r_arr))
 
-    result = minimize_scalar(neg_ll, bounds=(-2, 8), method="bounded")
+    result = minimize_scalar(neg_ll, bounds=(lo, hi), method="bounded")
+    # P1-5: warn if optimum is at a boundary
+    if abs(result.x - lo) < 1e-4:
+        warnings.warn(
+            f"NegBinomial r MLE hit lower bound (log_r={lo}); "
+            f"true r may be < {np.exp(lo):.3f}. "
+            "High overdispersion — consider inspecting the data.",
+            UserWarning,
+            stacklevel=2,
+        )
+    elif abs(result.x - hi) < 1e-4:
+        warnings.warn(
+            f"NegBinomial r MLE hit upper bound (log_r={hi}); "
+            f"true r may be > {np.exp(hi):.3f}. "
+            "Near-Poisson data — consider using Poisson model.",
+            UserWarning,
+            stacklevel=2,
+        )
     return float(np.exp(result.x))
 
 
@@ -179,7 +202,9 @@ class NegBinomialGBM(DistributionalGBM):
         if cycle == 0:
             baseline_mu = np.log(exposure) + np.log(self._mu_init)
         else:
-            baseline_mu = np.log(exposure)
+            # P1-4 fix: use previous cycle's mu estimate so coordinate descent
+            # refines rather than discards the previous fit.
+            baseline_mu = np.log(params["mu"]) + np.log(exposure)
 
         self._model_mu = self._fit_catboost(
             X, y, mu_params, baseline=baseline_mu
@@ -189,22 +214,26 @@ class NegBinomialGBM(DistributionalGBM):
 
         # --- Step 2: Overdispersion r ---
         if self.model_r:
-            # Fit a GBM for log r using deviance residuals
-            # NB deviance residual: d_i = 2*(y*log(y/mu) - (y+r)*log((y+r)/(mu+r)))
-            # We use a simpler approach: log of NB variance minus Poisson variance
-            # = log(mu^2/r), so log(r) = 2*log(mu) - log(Var_excess)
-            # Response: log(sample variance approximation)
+            # Fit a GBM for log r using Newton steps on the NB log-likelihood.
+            # dLL/d(log r) = r * [psi(y+r) - psi(r) + log(r/(r+mu)) + (mu-y)/(r+mu)]
+            #
+            # P0-3 fix: the original expression omitted the (mu-y)/(r+mu) term.
+            # The complete gradient wrt log(r) is:
+            #   score_r = r * (digamma(y+r) - digamma(r) - log(1 + mu/r) + (mu-y)/(r+mu))
+            # The information (Fisher expected second derivative wrt log(r)) is:
+            #   info_r = r^2 * (trigamma(r) - trigamma(y+r))
+            # which is positive because trigamma is decreasing.
+            from scipy.special import digamma, polygamma
             r_cur = params["r"]
-            # Score residual for r: gradient of NB log-likelihood wrt log(r)
-            # dLL/d(log r) = r * (psi(y+r) - psi(r) - log(1 + mu/r))
-            from scipy.special import digamma
             r_arr = r_cur
             score_r = r_arr * (
-                digamma(y + r_arr) - digamma(r_arr) - np.log(1.0 + mu_hat / r_arr + 1e-12)
+                digamma(y + r_arr)
+                - digamma(r_arr)
+                - np.log(1.0 + mu_hat / r_arr + 1e-12)
+                + (mu_hat - y) / (r_arr + mu_hat + 1e-12)  # P0-3 fix: missing term
             )
-            # Pseudo-response for log(r) model: Newton step
             # Information: r^2 * (trigamma(r) - trigamma(y+r))
-            from scipy.special import polygamma
+            # trigamma(r) > trigamma(y+r) for y>0, so info_r > 0
             info_r = r_arr ** 2 * (polygamma(1, r_arr) - polygamma(1, y + r_arr + 1e-12))
             info_r = np.clip(np.abs(info_r), 1e-4, None)
             pseudo_r = np.log(r_arr) + score_r / info_r  # Newton step in log space
@@ -228,7 +257,14 @@ class NegBinomialGBM(DistributionalGBM):
     def _predict_params(
         self, X: np.ndarray, exposure: np.ndarray
     ) -> Dict[str, np.ndarray]:
-        mu_hat = np.clip(self._model_mu.predict(X), 1e-6, None)
+        # P0-1 fix: apply log(exposure) as baseline. The mu model was trained
+        # with baseline = log(exposure) + log(mu_init), meaning the tree
+        # function f(x) represents the log rate per unit exposure. At
+        # prediction time we must add log(exposure) to get the absolute mean.
+        mu_hat = np.clip(
+            self._predict_catboost(self._model_mu, X, baseline=np.log(exposure)),
+            1e-6, None
+        )
 
         if self.model_r and self._model_r is not None:
             log_r_hat = self._model_r.predict(X)
