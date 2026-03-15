@@ -1,6 +1,6 @@
 [project]
 name = "insurance-distributional"
-version = "0.1.0"
+version = "0.1.1"
 description = "Distributional GBM for insurance pricing — Tweedie, ZIP, Gamma, Negative Binomial with CatBoost"
 readme = "README.md"
 license = { text = "MIT" }
@@ -30,6 +30,8 @@ dev = ["pytest>=7.0", "pytest-cov", "numpy>=1.24", "polars>=1.0"]
 [project.urls]
 Homepage = "https://github.com/burning-cost/insurance-distributional"
 Repository = "https://github.com/burning-cost/insurance-distributional"
+"Bug Tracker" = "https://github.com/burning-cost/insurance-distributional/issues"
+Documentation = "https://github.com/burning-cost/insurance-distributional#readme"
 
 [build-system]
 requires = ["hatchling"]
