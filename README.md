@@ -63,7 +63,7 @@ from insurance_distributional import TweedieGBM
 rng = np.random.default_rng(42)
 n = 1000
 
-# Synthetic UK motor portfolio
+# Synthetic covariate features
 vehicle_age = rng.integers(0, 15, n).astype(float)
 driver_age = rng.integers(18, 75, n).astype(float)
 ncd_years = rng.integers(0, 5, n).astype(float)
@@ -71,6 +71,11 @@ vehicle_group = rng.integers(1, 6, n).astype(float)  # 1=small, 5=prestige
 
 X = np.column_stack([vehicle_age, driver_age, ncd_years, vehicle_group])
 
+# Statistical demonstration DGP — mu values here are large (exp(5) ≈ 150)
+# to produce clearly non-zero Tweedie outcomes with n=1000. This is not
+# calibrated to UK motor frequencies (~0.12 claims/year). For realistic
+# motor pure premium modelling, set log_mu to produce mu ≈ 200-600 (claim costs)
+# or use a separate frequency * severity structure.
 # True mu: Tweedie with covariate-dependent dispersion
 log_mu = (
     5.0
@@ -83,10 +88,16 @@ mu_true = np.exp(log_mu)
 phi_true = 0.5 + 0.02 * vehicle_age  # older vehicles -> more dispersed losses
 
 # Simulate Tweedie (compound Poisson-Gamma) outcomes
-# Approximate via: Poisson frequency * Gamma severity
+# Approach: Y = sum of `counts` Gamma(shape=1, scale=gamma_scale) variates per observation.
+# NOTE: shape=1 (Exponential severity) is exact only for p=1.5. For other values of p,
+# the individual severity shape parameter is alpha = (2-p)/(p-1), not 1.
+# At p=1.5: alpha = (2-1.5)/(1.5-1) = 0.5/0.5 = 1 (Exponential). Correct.
+# At p=1.7: alpha = (2-1.7)/(1.7-1) = 0.3/0.7 ≈ 0.43. The simulation below would
+# be incorrect for p != 1.5 -- use scipy.stats.tweedie or a proper compound-Poisson
+# sampler for other power values.
 lam = mu_true ** (2 - 1.5) / (phi_true * (2 - 1.5))  # Poisson parameter
 counts = rng.poisson(lam)
-gamma_scale = mu_true / lam  # severity scale
+gamma_scale = mu_true / lam  # severity scale (Exponential: shape=1 assumed)
 y = np.array([
     rng.gamma(c, gamma_scale[i]) if c > 0 else 0.0
     for i, c in enumerate(counts)
@@ -184,7 +195,7 @@ exp_nb_test  = exposure_nb[n_tr_nb:]
 # Overdispersed frequency (fleet motor)
 model = NegBinomialGBM()
 model.fit(X_nb_train, y_nb_train, exposure=exp_nb_train)
-pred = model.predict(X_nb_test)
+pred = model.predict(X_nb_test, exposure=exp_nb_test)
 
 pred.variance  # mu + mu^2/r -- always > mu (unlike Poisson)
 pred.r         # overdispersion size parameter
