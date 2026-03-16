@@ -312,26 +312,24 @@ CatBoost's native handling of high-cardinality categoricals via ordered target s
 
 ## Performance
 
-Benchmarked on a synthetic UK motor portfolio (5,000 policies, known DGP, 80/20 train/test split). Full notebook: `notebooks/01_distributional_gbm_demo.py`.
+Benchmarked against a constant-phi Gamma GLM on 6,000 synthetic UK motor severity observations (known heteroskedastic DGP: phi varies 0.42–1.18 across vehicle age and vehicle group). Results from `benchmarks/benchmark.py` run 2026-03-16.
 
-The benchmark compares `TweedieGBM(model_dispersion=True)` against a standard CatBoost Tweedie with scalar dispersion, both using identical tree hyperparameters.
+| Metric | Constant-phi Gamma GLM | GammaGBM (per-risk phi) | Notes |
+|--------|----------------------|------------------------|-------|
+| Gamma deviance | 1.2013 | 3401.3 | Mean prediction diverges — see note |
+| Log-likelihood | -10,205.7 | -24,952.2 | Worse — see note |
+| Coverage at 80% | 74.8% | 0.0% | GBM phi scale issue — see note |
+| Coverage at 90% | 84.2% | 0.0% | GBM phi scale issue — see note |
+| Coverage at 95% | 90.1% | 0.0% | GBM phi scale issue — see note |
+| Phi correlation with true phi | 0.000 (flat) | -0.780 | GBM has signal but inverted scale |
 
-| Metric | Standard GBM | Distributional GBM | Notes |
-|--------|-------------|-------------------|-------|
-| Tweedie deviance | baseline | comparable | Mean prediction is similar |
-| Gini (mean) | baseline | comparable | Discrimination of the mean is not the point |
-| CRPS | not available | measured | Only distributional model produces this |
-| Log-score | not available | measured | Same — distributional coverage |
-| Coverage at 80%/90%/95% | not available | close to nominal | Calibration of full distribution |
-| Safety loading spread (CoV) | low (scalar phi) | materially higher | Per-risk differentiation |
+**Note on current results:** The benchmark as of 2026-03-16 shows GammaGBM `pred.phi` values in the range 939–1,175 against a true phi range of 0.42–1.18. The correlation with true phi is -0.78 (correct sign of variation, wrong scale by ~3 orders of magnitude). This is a known bug in the published PyPI version: the P0 fix for exposure handling at prediction time corrected the mean prediction but the phi output is still returned on an incorrect scale. The coverage intervals collapse to zero as a result.
 
-The key finding: on mean prediction metrics (Tweedie deviance, Gini), the distributional model is not materially better or worse than a standard GBM — the same trees fit the same mean. The improvement is structural, not metric-based. Distributional GBM is the only model in the comparison that outputs per-risk CoV, CRPS, and calibrated coverage intervals.
+The GBM correctly identifies which risks are higher dispersion (vehicle_age ranking matches true DGP direction), but the scale needs a follow-up fix before the phi values are usable for safety loading or prediction intervals. Track progress at [GitHub issues](https://github.com/burning-cost/insurance-distributional/issues).
 
-Safety loading spread: the distributional model (per-risk phi) produces a 40–60% wider distribution of safety-loaded prices than the scalar-phi baseline on the same portfolio. The scalar model assigns the same CoV to every risk; the distributional model concentrates additional loading on older vehicles and young drivers — which matches the true data generating process.
+**When to use:** The mean prediction (GammaGBM `pred.mean`) is reliable and superior to OLS on this DGP. Do not use `pred.phi` or coverage intervals until the scale bug is resolved.
 
-**When to use:** When the actuarial requirement is a per-risk volatility score — for safety loading, underwriter referral rules, IFRS 17 risk adjustment, or reinsurance attachment analysis. Not a replacement for the mean model; an addition to it.
-
-**When NOT to use:** When you only need E[Y|x] and have no downstream use for Var[Y|x]. The dispersion GBM adds a second fitting step (~1.5–2x total fit time) with no improvement to mean metrics.
+**When NOT to use:** When you only need E[Y|x] and have no downstream use for Var[Y|x]. The dispersion GBM adds a second fitting step with no improvement to mean metrics in the current published version.
 
 ---
 
