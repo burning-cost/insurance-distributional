@@ -1,5 +1,5 @@
 """
-Regression tests for P0 and P1 bugs fixed in v0.1.1.
+Regression tests for P0 and P1 bugs fixed in v0.1.1 and v0.1.2.
 
 These tests exercise the specific mathematical properties that were broken:
 
@@ -16,6 +16,14 @@ P0-3: NegBinomialGBM score_r gradient for the Newton step on r must include
       the (mu-y)/(r+mu) term. Without it the Newton step is biased upward,
       causing r to be overestimated when mu > y on average (which is the
       common case at convergence).
+
+P0-4: TweedieGBM and GammaGBM phi predictions were ~10^6 too large because
+      _fit_cycle used model.predict(X) (no baseline) to compute mu_hat for
+      phi residuals. CatBoost Tweedie does not include the training baseline
+      in model.predict() output — the baseline must be re-applied. Without it,
+      mu_hat ≈ 1.0 instead of ≈ mu_true, making d = (y-1)^2/1^p ≈ y^2, which
+      is O(10^6) too large. After log-transform and exp at prediction time,
+      phi predictions were millions of times the true value.
 """
 
 from __future__ import annotations
@@ -350,6 +358,137 @@ class TestP03NegBinomScoreR:
         assert np.isfinite(ls), f"log_score should be finite, got {ls}"
         assert ls > 0, "NLL should be positive"
         assert ls < 20, f"NLL={ls} is unreasonably large — gradient may be wrong"
+
+
+# ---------------------------------------------------------------------------
+# P0-4 regression: phi predictions on correct scale after baseline fix
+# ---------------------------------------------------------------------------
+
+
+class TestP04PhiScale:
+    """
+    TweedieGBM and GammaGBM phi predictions must be on the correct scale.
+
+    Root cause: _fit_cycle called model.predict(X) without re-applying the
+    training baseline. CatBoost Tweedie with baseline=b trains trees f(x) to
+    minimise Tweedie(y, exp(b + f(x))), but model.predict(X) returns exp(f(x))
+    — NOT exp(b + f(x)). Without the baseline, mu_hat ≈ 1.0 rather than the
+    true mu (hundreds to thousands). This inflated phi residuals by O(mu^2),
+    so log_d ≈ log(mu^2) ≈ 14 instead of log(phi) ≈ -0.7. At prediction time,
+    phi_hat = exp(14) ≈ 10^6 instead of exp(-0.7) ≈ 0.5.
+
+    Fix: in _fit_cycle, use _predict_catboost(model_mu, X, baseline=baseline_mu)
+    to get correctly scaled mu predictions for phi residual computation.
+    For GammaGBM, also store _log_mu_init and apply it in _predict_params.
+    """
+
+    def test_gamma_phi_in_correct_range(self, gamma_data):
+        """
+        GammaGBM phi predictions must be O(1), not O(10^6).
+
+        gamma_data has shape_true=2.0, phi_true=0.5. The model won't
+        recover phi exactly (300 obs, one cycle, no true signal in X),
+        but predictions must be within 3 orders of magnitude of 0.5.
+        """
+        from insurance_distributional import GammaGBM
+
+        model = GammaGBM(model_dispersion=True)
+        model.fit(gamma_data["X"], gamma_data["y"])
+        pred = model.predict(gamma_data["X"])
+
+        # phi_true = 0.5; after fix, phi_hat should be in [0.01, 100]
+        # Before fix, phi_hat was O(10^6)
+        assert pred.phi.max() < 100.0, (
+            f"phi_hat.max()={pred.phi.max():.2f} is implausibly large; "
+            f"expected < 100 for typical Gamma insurance data. "
+            f"This likely indicates the baseline fix was not applied."
+        )
+
+    def test_tweedie_phi_in_correct_range(self, tweedie_data):
+        """
+        TweedieGBM phi predictions must be O(1), not O(10^6).
+
+        tweedie_data has phi_true=0.5. Same check as for GammaGBM.
+        """
+        from insurance_distributional import TweedieGBM
+
+        model = TweedieGBM(power=1.5, model_dispersion=True)
+        model.fit(tweedie_data["X"], tweedie_data["y"])
+        pred = model.predict(tweedie_data["X"])
+
+        assert pred.phi.max() < 100.0, (
+            f"phi_hat.max()={pred.phi.max():.2f} is implausibly large; "
+            f"expected < 100 for typical Tweedie insurance data."
+        )
+
+    def test_gamma_phi_positive_correlation_with_truth(self):
+        """
+        GammaGBM should learn that higher phi covariates produce higher phi.
+
+        Generate data where phi is determined by X[:,0]: phi = 0.3 + 0.4*(X[:,0]>0).
+        After fitting, pred.phi should correlate positively with X[:,0].
+
+        Before the baseline fix, correlation was -0.78 (signal detected but
+        inverted + wrong scale). After fix, correlation should be > 0.
+        """
+        from insurance_distributional import GammaGBM
+
+        rng = np.random.default_rng(12)
+        n = 600
+        X = rng.standard_normal((n, 4))
+        # phi is determined by X[:,0]: high X[:,0] -> high phi
+        phi_true = 0.3 + 0.5 * (X[:, 0] > 0).astype(float)
+        mu_true = 800.0  # constant mean to isolate phi signal
+        shape_true = 1.0 / phi_true
+        y = np.array([rng.gamma(shape_true[i], mu_true * phi_true[i]) for i in range(n)])
+
+        model = GammaGBM(
+            model_dispersion=True,
+            catboost_params_mu={"iterations": 200},
+            catboost_params_phi={"iterations": 200},
+        )
+        model.fit(X, y)
+        pred = model.predict(X)
+
+        # phi predictions should be in the right ballpark
+        assert pred.phi.max() < 100.0, (
+            f"phi predictions still on wrong scale: max={pred.phi.max():.2f}"
+        )
+
+        # Predicted phi should rank correctly — high X[:,0] should have higher phi
+        mean_phi_high = float(pred.phi[X[:, 0] > 0].mean())
+        mean_phi_low = float(pred.phi[X[:, 0] <= 0].mean())
+        assert mean_phi_high > mean_phi_low, (
+            f"Mean phi for X[:,0]>0 ({mean_phi_high:.4f}) should exceed "
+            f"mean phi for X[:,0]<=0 ({mean_phi_low:.4f}). "
+            f"The phi model failed to learn the dispersion signal."
+        )
+
+    def test_gamma_mu_predictions_in_correct_range(self, gamma_data):
+        """
+        GammaGBM mu predictions must be on the y scale.
+
+        gamma_data has mu_true = exp(6.5 + 0.5*X[:,0]) ≈ 300-1500.
+        After fix, mu_hat should be in the same range. Before the fix,
+        mu_hat was ~1.0 (bare tree output without baseline).
+        """
+        from insurance_distributional import GammaGBM
+
+        model = GammaGBM()
+        model.fit(gamma_data["X"], gamma_data["y"])
+        pred = model.predict(gamma_data["X"])
+
+        y = gamma_data["y"]
+        y_mean = float(np.mean(y))
+
+        # mu predictions should be within 10x of the true mean
+        assert pred.mu.mean() > y_mean / 10, (
+            f"pred.mu.mean()={pred.mu.mean():.2f} is far below y_mean={y_mean:.2f}. "
+            f"Baseline may not be applied in _predict_params."
+        )
+        assert pred.mu.mean() < y_mean * 10, (
+            f"pred.mu.mean()={pred.mu.mean():.2f} is far above y_mean={y_mean:.2f}."
+        )
 
 
 # ---------------------------------------------------------------------------

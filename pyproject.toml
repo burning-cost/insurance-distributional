@@ -1,6 +1,6 @@
 [project]
 name = "insurance-distributional"
-version = "0.1.1"
+version = "0.1.2"
 description = "Distributional GBM for insurance pricing — Tweedie, ZIP, Gamma, Negative Binomial with CatBoost"
 readme = "README.md"
 license = { text = "MIT" }

@@ -60,7 +60,7 @@ from .scoring import (
 from .tweedie import TweedieGBM
 from .zip import ZIPGBM
 
-__version__ = "0.1.0"
+__version__ = "0.1.2"
 
 __all__ = [
     # Models

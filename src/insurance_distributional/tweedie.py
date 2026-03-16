@@ -21,6 +21,21 @@ Key implementation detail: the mu model uses CatBoost's native Tweedie loss
 (loss_function="Tweedie:variance_power=p"). This means CatBoost handles all the
 gradient/Hessian computation for mu internally. We only need to compute the
 dispersion residuals for the phi model.
+
+Baseline handling:
+  CatBoost Tweedie loss uses a log link internally. When training with a Pool
+  that has a baseline=b, CatBoost minimises Tweedie(y, exp(b + f(x))). The model
+  stores only f(x) (the tree contributions); model.predict(X) returns exp(f(x))
+  not exp(b + f(x)). The baseline must be re-applied at inference time.
+
+  For TweedieGBM: training baseline = log(exposure) + log(mu_init). At inference
+  we pass baseline = log(exposure) via _predict_catboost. The trees learn f(x)
+  that includes the log(mu_init) offset, so the prediction recovers the correct
+  per-unit-exposure rate and the exposure offset scales it back to absolute mu.
+
+  For the _fit_cycle intermediate mu predictions (used to compute phi residuals),
+  we also need to apply the training baseline; without it, mu_hat ≈ 1.0 and the
+  phi residuals d = (y - 1)^2 / 1^p are O(10^6) too large.
 """
 
 from __future__ import annotations
@@ -234,6 +249,13 @@ class TweedieGBM(DistributionalGBM):
           Compute squared Pearson residuals d_i = (y_i - mu_hat_i)^2 / mu_hat_i^p.
           Fit a Gamma GBM with log link on d_i to estimate phi(x).
           Use exposure as sample weight (higher exposure = more information).
+
+        P0-4 fix: when extracting mu_hat from the just-fitted model, we must
+        re-apply the training baseline. CatBoost Tweedie stores only the tree
+        increments f(x); model.predict(X) without a baseline returns exp(f(x))
+        ≈ 1.0 rather than exp(baseline + f(x)) ≈ mu_true. The corrupted mu_hat
+        then inflates phi residuals by O(mu_true^2), causing phi predictions that
+        are millions of times too large.
         """
         p = self.power
 
@@ -258,8 +280,10 @@ class TweedieGBM(DistributionalGBM):
             X, y, mu_params, baseline=baseline_mu
         )
 
-        # Get mu predictions (CatBoost Tweedie predicts on natural scale)
-        mu_hat = self._model_mu.predict(X)
+        # P0-4 fix: apply the training baseline when extracting mu_hat for phi
+        # residual computation. Without this, mu_hat ≈ 1.0 (raw tree output,
+        # no baseline), which destroys the phi training signal.
+        mu_hat = self._predict_catboost(self._model_mu, X, baseline=baseline_mu)
         mu_hat = np.clip(mu_hat, 1e-6, None)
         params["mu"] = mu_hat
 

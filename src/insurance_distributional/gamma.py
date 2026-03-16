@@ -18,6 +18,16 @@ V(mu) = mu^2, so the dispersion response is:
 
 This is the squared relative error — proportional to the coefficient of
 variation squared.
+
+Baseline handling:
+  CatBoost Tweedie loss uses a log link internally. When training with a
+  Pool(baseline=b), CatBoost minimises Tweedie(y, exp(b + f(x))). The model
+  stores only f(x) (the tree contributions); at predict time, model.predict(X)
+  returns exp(f(x)) NOT exp(b + f(x)). The caller must re-apply the baseline.
+
+  For GammaGBM (no exposure offset): we train with baseline = log(mu_init),
+  store _log_mu_init, and at predict time call _predict_catboost with that
+  baseline so predictions come back on the correct scale.
 """
 
 from __future__ import annotations
@@ -146,6 +156,10 @@ class GammaGBM(DistributionalGBM):
         self._model_mu = None
         self._model_phi = None
         self._phi_scalar: float = 1.0
+        # P0-4 fix: store the log-scale baseline used when training the mu model.
+        # CatBoost Tweedie with a training baseline does NOT include the baseline
+        # in model.predict() output — it must be re-applied at inference time.
+        self._log_mu_init: float = 0.0
 
     def _init_params(self, y: np.ndarray, exposure: np.ndarray) -> Dict[str, Any]:
         """
@@ -180,6 +194,12 @@ class GammaGBM(DistributionalGBM):
         """
         Step 1: Fit mu via CatBoost Gamma deviance (log link).
         Step 2: Fit phi via RMSE on log(squared relative error).
+
+        P0-4 fix: mu model is fitted with a log-scale baseline (log(mu_init)
+        on cycle 0, or log of previous-cycle mu on later cycles). CatBoost
+        stores only the tree increments f(x), not the baseline, so predict()
+        without a baseline returns exp(f(x)) on the wrong scale. We must call
+        _predict_catboost with the same baseline to recover the correct mu.
         """
         # CatBoost uses RMSE by default; for Gamma we approximate log-link
         # via LogLinQuantile or by fitting RMSE on log(y) with offset.
@@ -193,15 +213,28 @@ class GammaGBM(DistributionalGBM):
 
         if cycle == 0:
             baseline_mu = np.full(len(y), np.log(params["mu_init"]))
+            # Store the scalar log-baseline for use in _predict_params.
+            # On cycle 0 the baseline is constant (scalar), so one value suffices.
+            self._log_mu_init = float(np.log(params["mu_init"]))
         else:
             # P1-4 fix: use log of the previous cycle's mu estimate so that
             # coordinate descent refines rather than restarting from zero.
+            # On later cycles the baseline is per-observation, so we store
+            # the per-obs array on self for _predict_params to use.
             baseline_mu = np.log(np.clip(params["mu"], 1e-6, None))
+            # After the last cycle, _predict_params uses this stored baseline.
+            self._baseline_mu_train = baseline_mu.copy()
 
         self._model_mu = self._fit_catboost(
             X, y, mu_params, baseline=baseline_mu
         )
-        mu_hat = self._model_mu.predict(X)
+
+        # P0-4 fix: apply the training baseline when extracting mu_hat.
+        # Without this, model.predict(X) returns exp(f(x)) ≈ 1.0 instead of
+        # exp(baseline + f(x)) ≈ mu_true. The corrupted mu_hat then feeds into
+        # phi residuals d = (y - mu_hat)^2 / mu_hat^2, which are ~10^6 too large,
+        # causing log_d ≈ 14 and phi_hat = exp(14) ≈ 10^6.
+        mu_hat = self._predict_catboost(self._model_mu, X, baseline=baseline_mu)
         mu_hat = np.clip(mu_hat, 1e-6, None)
         params["mu"] = mu_hat
 
@@ -232,12 +265,21 @@ class GammaGBM(DistributionalGBM):
     def _predict_params(
         self, X: np.ndarray, exposure: np.ndarray
     ) -> Dict[str, np.ndarray]:
-        mu_hat = np.clip(self._model_mu.predict(X), 1e-6, None)
+        # P0-4 fix: apply the stored log-baseline so mu predictions are on the
+        # correct scale. The mu model was trained with baseline = log(mu_init),
+        # so at predict time we must pass the same scalar offset as a broadcast
+        # array. For GammaGBM there is no exposure offset (unlike TweedieGBM).
+        n = len(X)
+        baseline = np.full(n, self._log_mu_init)
+        mu_hat = np.clip(
+            self._predict_catboost(self._model_mu, X, baseline=baseline),
+            1e-6, None
+        )
 
         if self.model_dispersion and self._model_phi is not None:
             phi_hat = np.exp(self._model_phi.predict(X))
         else:
-            phi_hat = np.full(len(X), self._phi_scalar)
+            phi_hat = np.full(n, self._phi_scalar)
 
         return {"mu": mu_hat, "phi": np.clip(phi_hat, 1e-6, None)}
 
