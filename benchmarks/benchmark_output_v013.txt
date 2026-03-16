@@ -1,0 +1,65 @@
+======================================================================
+BENCHMARK: GammaGBM (per-risk phi) vs constant-phi Gamma GLM
+  Training rows: 4800, Test rows: 1200
+  True phi range: [0.420, 1.180]
+  True CoV range: [0.648, 1.086]
+======================================================================
+
+Baseline (constant-phi Gamma GLM): phi = 1.0306, CoV = 1.0152
+
+Fitting GammaGBM (distributional, per-risk phi)...
+
+======================================================================
+TABLE 1: Gamma deviance (mean prediction — should be similar)
+  Method                            Gamma Deviance  Note
+------------------------------------------------------------
+  Constant-phi Gamma GLM                  1.201314
+  GammaGBM (per-risk phi)                 0.958664  mean preds similar
+  (Mean prediction is not the differentiator — distribution is)
+
+======================================================================
+TABLE 2: Log-likelihood on test set (higher = better)
+  Method                            Log-likelihood
+-------------------------------------------------------
+  Constant-phi Gamma GLM                  -10205.7
+  GammaGBM (per-risk phi)                 -10050.3
+  GammaGBM improvement: +1.5%
+
+======================================================================
+TABLE 3: Prediction interval coverage (nominal vs empirical)
+     Level     Nominal    Constant-phi      GammaGBM    Best calibration
+----------------------------------------------------------------------
+       80%      0.8000          0.7483        0.8042            GammaGBM
+       90%      0.9000          0.8417        0.8950            GammaGBM
+       95%      0.9500          0.9008        0.9492            GammaGBM
+  (Empirical coverage should match nominal; constant-phi is globally wrong)
+
+======================================================================
+TABLE 4: Volatility scoring — correlation of predicted phi with true phi
+  Constant-phi correlation with true phi : +0.0000  (all same value)
+  GammaGBM correlation with true phi     : +0.7018  (per-risk estimate)
+
+  CoV (sqrt(phi)) by vehicle_age quartile in test set:
+  Quartile             True CoV    GBM pred CoV     Const CoV
+----------------------------------------------------------
+  va <= 4                0.7665          0.8089        1.0152
+  va <= 7                0.8606          0.9059        1.0152
+  va <= 11               0.9352          1.0264        1.0152
+  va > 11                1.0103          1.1173        1.0152
+
+======================================================================
+TABLE 5: Safety loading spread (k=0.5 loading factor)
+  Constant-phi: loading spread (CoV of loading ratio) = 0.000000
+  GammaGBM:     loading spread (CoV of loading ratio) = 0.086263
+  GammaGBM produces 862631697.9x more spread in safety loadings
+  (constant-phi assigns same loading to all risks; distributional differentiates)
+
+======================================================================
+SUMMARY: GammaGBM outperforms constant-phi baseline on:
+  - Log-likelihood (higher — better distributional fit)
+  - Prediction interval calibration (coverage closer to nominal)
+  - Volatility ranking (predicted phi correlates with true phi)
+  - Safety loading spread (differentiates risk where baseline cannot)
+  Mean prediction quality (gamma deviance) is comparable.
+  The improvement is structural: distributional, not just mean accuracy.
+======================================================================

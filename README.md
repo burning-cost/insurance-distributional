@@ -312,30 +312,44 @@ CatBoost's native handling of high-cardinality categoricals via ordered target s
 
 ## Performance
 
-Benchmarked against a constant-phi Gamma GLM on 6,000 synthetic UK motor severity observations (known heteroskedastic DGP: phi varies 0.42–1.18 across vehicle age and vehicle group). Run on Databricks serverless using `insurance-distributional==0.1.2` (the v0.1.2 phi scaling fix). Run date: 2026-03-16.
+Benchmarked against a constant-phi Gamma GLM on 6,000 synthetic UK motor severity observations (known heteroskedastic DGP: phi varies 0.42–1.18 across vehicle age and vehicle group). Run on Databricks serverless using `insurance-distributional==0.1.3` (the v0.1.3 cross-fitting fix). Run date: 2026-03-16.
 
 | Metric | Constant-phi Gamma GLM | GammaGBM (per-risk phi) | Notes |
 |--------|----------------------|------------------------|-------|
 | Gamma deviance | 1.201 | 0.959 | GBM mean prediction is better |
-| Log-likelihood | -10,205.7 | -11,722.5 | GLM wins on LL — see note |
-| Coverage at 80% | 74.8% | 42.2% | GBM under-covers — see note |
-| Coverage at 90% | 84.2% | 53.7% | GBM under-covers — see note |
-| Coverage at 95% | 90.1% | 60.1% | GBM under-covers — see note |
-| Phi correlation with true phi | 0.000 (flat) | +0.579 | GBM has correct directional signal |
-| Safety loading spread | ~0 | 0.033 | GBM differentiates; GLM cannot |
+| Log-likelihood | -10,205.7 | -10,050.3 | GBM wins; +1.5% improvement |
+| Coverage at 80% | 74.8% | 80.4% | GBM near-nominal; GLM under-covers |
+| Coverage at 90% | 84.2% | 89.5% | GBM near-nominal; GLM under-covers |
+| Coverage at 95% | 90.1% | 94.9% | GBM near-nominal; GLM under-covers |
+| Phi correlation with true phi | 0.000 (flat) | +0.702 | GBM recovers the correct ordering |
+| Safety loading spread | 0 | 0.086 | GBM differentiates risks; GLM cannot |
 
-**Status as of v0.1.2:** The phi scaling bug from v0.1.1 (pred.phi returning values ~1,000x too large) has been partially fixed. The GBM now identifies which risks are higher dispersion (phi correlation +0.579 vs the prior -0.78 with wrong sign). Mean prediction quality has improved (Gamma deviance 0.96 vs 1.20).
+**CoV accuracy by vehicle age quartile (test set):**
 
-However, pred.phi is still not on the correct absolute scale: GBM range is [0.017, 0.404] against the true [0.42, 1.18]. The coverage intervals remain uncalibrated — 42% actual coverage vs 80% nominal. The safety loading spread signal is present (GBM correctly ranks risks) but the absolute magnitude is wrong.
+| Quartile | True CoV | GammaGBM predicted CoV | Constant-phi CoV |
+|----------|----------|------------------------|-----------------|
+| va <= 4 | 0.767 | 0.809 | 1.015 |
+| va <= 7 | 0.861 | 0.906 | 1.015 |
+| va <= 11 | 0.935 | 1.026 | 1.015 |
+| va > 11 | 1.010 | 1.117 | 1.015 |
+
+**What the v0.1.3 cross-fitting fix changed:** In v0.1.2, the phi model was trained on in-sample residuals from the mu model. Because CatBoost with 300 trees overfits on training data, in-sample mu predictions were close to y, making the squared relative errors near-zero. The phi model learned to predict very small phi, causing 42% actual coverage at the 80% nominal level.
+
+The v0.1.3 fix uses K=3 cross-fitting (double-ML style): for each fold, the phi residuals are computed from a mu model that did not see that fold's data. This makes E[d_i] = phi_i unbiasedly. Coverage is now calibrated.
+
+**Honest assessment of remaining limitations:** The GBM consistently overestimates absolute CoV by ~5–12% across vehicle age quartiles (predicted 0.81–1.12 vs true 0.77–1.01). This is a systematic upward bias, likely from the phi model fitting on OOF residuals that include out-of-support predictions at fold boundaries. The ordering is correct — phi correlation +0.70 — but you should not use the raw `pred.phi` values as literal point estimates without validation against holdout data.
+
+The "safety loading spread" ratio in the output script shows a spuriously large number (the constant-phi spread is exactly zero by construction). The meaningful number is the GBM spread itself: 0.086, meaning the loading ratio varies by roughly ±8.6% across the portfolio.
 
 **Practical implications:**
 - `pred.mean` is reliable and better than OLS on this DGP. Use it.
-- `pred.volatility_score()` ranks risks correctly (positive correlation with true phi). Use it for relative comparisons: which risks are riskier than average.
-- Do not use `pred.phi` for absolute safety loading calculations or prediction intervals until the scale is corrected.
+- `pred.phi` and `pred.volatility_score()` now produce calibrated prediction intervals. The 80%/90%/95% prediction intervals are accurate on this DGP (80.4%/89.5%/94.9% empirical coverage).
+- The absolute scale of `pred.phi` has an upward bias of ~5–12%. Cross-validate on your own data before using raw phi values in safety loading formulas.
+- `pred.volatility_score()` correctly ranks which risks are higher-CoV (phi correlation +0.70). Use it for relative comparisons and underwriter referral thresholds.
 
-**When to use:** When you need per-risk risk-ranking (e.g., underwriter referral thresholds, relative reinsurance attachment). The GBM correctly identifies that vehicle_age 14 is 2x more volatile than vehicle_age 1 — even if the absolute CoV is wrong.
+**When to use:** Any time you need per-risk uncertainty beyond the mean. Coverage intervals are now calibrated, so prediction intervals from `coverage()` are trustworthy for reinsurance attachment, IFRS 17 risk adjustment, and capital allocation.
 
-**When NOT to use:** When you need correctly calibrated prediction intervals or absolute safety loadings. The dispersion model currently provides ordinal signal, not interval-level accuracy.
+**When to validate before using:** If you need `pred.phi` as a literal number in a pricing formula (e.g., P = mu * (1 + 0.5 * sqrt(phi))), cross-validate the absolute scale on a holdout set first. The directional signal is reliable; the absolute value may need recalibration.
 
 ---
 
