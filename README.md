@@ -312,24 +312,30 @@ CatBoost's native handling of high-cardinality categoricals via ordered target s
 
 ## Performance
 
-Benchmarked against a constant-phi Gamma GLM on 6,000 synthetic UK motor severity observations (known heteroskedastic DGP: phi varies 0.42–1.18 across vehicle age and vehicle group). Results from `benchmarks/benchmark.py` run 2026-03-16.
+Benchmarked against a constant-phi Gamma GLM on 6,000 synthetic UK motor severity observations (known heteroskedastic DGP: phi varies 0.42–1.18 across vehicle age and vehicle group). Run on Databricks serverless using `insurance-distributional==0.1.2` (the v0.1.2 phi scaling fix). Run date: 2026-03-16.
 
 | Metric | Constant-phi Gamma GLM | GammaGBM (per-risk phi) | Notes |
 |--------|----------------------|------------------------|-------|
-| Gamma deviance | 1.2013 | 3401.3 | Mean prediction diverges — see note |
-| Log-likelihood | -10,205.7 | -24,952.2 | Worse — see note |
-| Coverage at 80% | 74.8% | 0.0% | GBM phi scale issue — see note |
-| Coverage at 90% | 84.2% | 0.0% | GBM phi scale issue — see note |
-| Coverage at 95% | 90.1% | 0.0% | GBM phi scale issue — see note |
-| Phi correlation with true phi | 0.000 (flat) | -0.780 | GBM has signal but inverted scale |
+| Gamma deviance | 1.201 | 0.959 | GBM mean prediction is better |
+| Log-likelihood | -10,205.7 | -11,722.5 | GLM wins on LL — see note |
+| Coverage at 80% | 74.8% | 42.2% | GBM under-covers — see note |
+| Coverage at 90% | 84.2% | 53.7% | GBM under-covers — see note |
+| Coverage at 95% | 90.1% | 60.1% | GBM under-covers — see note |
+| Phi correlation with true phi | 0.000 (flat) | +0.579 | GBM has correct directional signal |
+| Safety loading spread | ~0 | 0.033 | GBM differentiates; GLM cannot |
 
-**Note on current results:** The benchmark as of 2026-03-16 shows GammaGBM `pred.phi` values in the range 939–1,175 against a true phi range of 0.42–1.18. The correlation with true phi is -0.78 (correct sign of variation, wrong scale by ~3 orders of magnitude). This is a known bug in the published PyPI version: the P0 fix for exposure handling at prediction time corrected the mean prediction but the phi output is still returned on an incorrect scale. The coverage intervals collapse to zero as a result.
+**Status as of v0.1.2:** The phi scaling bug from v0.1.1 (pred.phi returning values ~1,000x too large) has been partially fixed. The GBM now identifies which risks are higher dispersion (phi correlation +0.579 vs the prior -0.78 with wrong sign). Mean prediction quality has improved (Gamma deviance 0.96 vs 1.20).
 
-The GBM correctly identifies which risks are higher dispersion (vehicle_age ranking matches true DGP direction), but the scale needs a follow-up fix before the phi values are usable for safety loading or prediction intervals. Track progress at [GitHub issues](https://github.com/burning-cost/insurance-distributional/issues).
+However, pred.phi is still not on the correct absolute scale: GBM range is [0.017, 0.404] against the true [0.42, 1.18]. The coverage intervals remain uncalibrated — 42% actual coverage vs 80% nominal. The safety loading spread signal is present (GBM correctly ranks risks) but the absolute magnitude is wrong.
 
-**When to use:** The mean prediction (GammaGBM `pred.mean`) is reliable and superior to OLS on this DGP. Do not use `pred.phi` or coverage intervals until the scale bug is resolved.
+**Practical implications:**
+- `pred.mean` is reliable and better than OLS on this DGP. Use it.
+- `pred.volatility_score()` ranks risks correctly (positive correlation with true phi). Use it for relative comparisons: which risks are riskier than average.
+- Do not use `pred.phi` for absolute safety loading calculations or prediction intervals until the scale is corrected.
 
-**When NOT to use:** When you only need E[Y|x] and have no downstream use for Var[Y|x]. The dispersion GBM adds a second fitting step with no improvement to mean metrics in the current published version.
+**When to use:** When you need per-risk risk-ranking (e.g., underwriter referral thresholds, relative reinsurance attachment). The GBM correctly identifies that vehicle_age 14 is 2x more volatile than vehicle_age 1 — even if the absolute CoV is wrong.
+
+**When NOT to use:** When you need correctly calibrated prediction intervals or absolute safety loadings. The dispersion model currently provides ordinal signal, not interval-level accuracy.
 
 ---
 
