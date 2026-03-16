@@ -436,7 +436,7 @@ wheels = [
 
 [[package]]
 name = "insurance-distributional"
-version = "0.1.0"
+version = "0.1.1"
 source = { editable = "." }
 dependencies = [
     { name = "catboost" },
@@ -465,8 +465,8 @@ requires-dist = [
     { name = "matplotlib", marker = "extra == 'plots'", specifier = ">=3.6" },
     { name = "numpy", specifier = ">=1.24" },
     { name = "numpy", marker = "extra == 'dev'", specifier = ">=1.24" },
-    { name = "polars", specifier = ">=0.20" },
-    { name = "polars", marker = "extra == 'dev'", specifier = ">=0.20" },
+    { name = "polars", specifier = ">=1.0" },
+    { name = "polars", marker = "extra == 'dev'", specifier = ">=1.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0" },
     { name = "pytest-cov", marker = "extra == 'dev'" },
     { name = "scipy", specifier = ">=1.10" },

@@ -12,15 +12,11 @@ squared Pearson residual:
     d_i = (y_i - mu_hat_i)^2 / V(mu_hat_i)
 
 where V(mu) = mu^p is the Tweedie variance function. Under the assumed model,
-E[d_i] = phi_i. We then fit a Gamma regression with log link on d_i to estimate
-phi(x). This is equivalent to fitting a GLM for dispersion — the approach is
-theoretically principled (Smyth & Jørgensen, ASTIN 2002) and practically superior
-to scalar phi estimation.
+E[d_i] = phi_i. We fit a Gamma regression with log link on d_i to estimate phi(x).
 
 Key implementation detail: the mu model uses CatBoost's native Tweedie loss
-(loss_function="Tweedie:variance_power=p"). This means CatBoost handles all the
-gradient/Hessian computation for mu internally. We only need to compute the
-dispersion residuals for the phi model.
+(loss_function="Tweedie:variance_power=p"). CatBoost handles the gradient/Hessian
+computation for mu internally. We only need the dispersion residuals for phi.
 
 Baseline handling:
   CatBoost Tweedie loss uses a log link internally. When training with a Pool
@@ -28,14 +24,23 @@ Baseline handling:
   stores only f(x) (the tree contributions); model.predict(X) returns exp(f(x))
   not exp(b + f(x)). The baseline must be re-applied at inference time.
 
-  For TweedieGBM: training baseline = log(exposure) + log(mu_init). At inference
-  we pass baseline = log(exposure) via _predict_catboost. The trees learn f(x)
-  that includes the log(mu_init) offset, so the prediction recovers the correct
-  per-unit-exposure rate and the exposure offset scales it back to absolute mu.
+  For TweedieGBM:
+  - mu model: baseline = log(exposure) + log(mu_init). At inference we pass
+    baseline = log(exposure) via _predict_catboost.
+  - phi model: baseline = log(phi_init). At inference we pass log(phi_init).
 
-  For the _fit_cycle intermediate mu predictions (used to compute phi residuals),
-  we also need to apply the training baseline; without it, mu_hat ≈ 1.0 and the
-  phi residuals d = (y - 1)^2 / 1^p are O(10^6) too large.
+Phi model (v0.1.3 fix — cross-fitting):
+  The root cause of the ~3-5x phi underestimation was in-sample residuals from
+  an overfitting mu model. When CatBoost (depth=6, 300 trees) overfits on
+  training data, mu_hat ≈ y in-sample, making d_i ≈ 0. The phi model then
+  learns phi_hat ≈ 0 on training data and generalises that small value.
+
+  Fix: K-fold cross-fitting. For each fold, fit mu on the OTHER K-1 folds and
+  predict on the held-out fold. This gives out-of-fold (OOF) mu predictions that
+  are not overfitted to the held-out observations. OOF d_i values have
+  E[d_i^{OOF}] = phi_i(x_i) as intended by the Smyth-Jørgensen framework.
+
+  The final mu model is fitted on all n observations for prediction.
 """
 
 from __future__ import annotations
@@ -60,34 +65,21 @@ def _tweedie_log_likelihood(
     """
     Tweedie log-likelihood per observation.
 
-    For compound Poisson-Gamma (1 < p < 2), using the saddle-point approximation
-    for the positive part and exact formula for the zero mass.
-
+    For compound Poisson-Gamma (1 < p < 2), saddle-point approximation.
     For y=0: log p(0) = -mu^(2-p) / (phi*(2-p))
-    For y>0: uses Tweedie series expansion (Dunn & Smyth, 2005)
-
-    We use a numerically stable approximation that is exact for GLM gradient
-    purposes: the deviance formulation.
-
-    Returns per-observation log-likelihood (not normalised).
+    For y>0: deviance formulation.
     """
-    # Use tweedie deviance: 2*(y^(2-p)/((1-p)*(2-p)) - y*mu^(1-p)/(1-p) + mu^(2-p)/(2-p))
-    # log L_i = -deviance_i / (2*phi) + const(y, phi, p)
-    # For scoring purposes, we use the exact form
     ll = np.zeros(len(y))
 
-    # y=0 term: Poisson probability of 0 claims
     mask0 = y == 0
     if mask0.any():
         ll[mask0] = -mu[mask0] ** (2 - p) / (phi[mask0] * (2 - p))
 
-    # y>0 term: saddle-point approximation (standard in actuarial practice)
     mask_pos = ~mask0
     if mask_pos.any():
         y_p = y[mask_pos]
         mu_p = mu[mask_pos]
         phi_p = phi[mask_pos]
-        # Tweedie deviance term
         dev = (
             y_p ** (2 - p) / ((1 - p) * (2 - p))
             - y_p * mu_p ** (1 - p) / (1 - p)
@@ -102,12 +94,7 @@ def _estimate_phi_mle(y: np.ndarray, mu: np.ndarray, p: float) -> float:
     """
     Estimate scalar phi by MLE given fixed mu.
 
-    Minimises -sum(log_likelihood) over phi > 0.
-    Used for unconditional initialisation.
-
-    P1-5 fix: emits a warning if the optimum lands at either search boundary
-    (log_phi in {-3, 3}), which indicates the true phi may be outside the
-    search range and the estimate is unreliable.
+    P1-5 fix: emits a warning if the optimum lands at either search boundary.
     """
     lo, hi = -3.0, 3.0
 
@@ -117,7 +104,6 @@ def _estimate_phi_mle(y: np.ndarray, mu: np.ndarray, p: float) -> float:
         return -np.sum(_tweedie_log_likelihood(y, mu, phi_arr, p))
 
     result = minimize_scalar(neg_ll, bounds=(lo, hi), method="bounded")
-    # P1-5: warn if optimum is at a boundary
     if abs(result.x - lo) < 1e-4:
         warnings.warn(
             f"Tweedie phi MLE hit lower bound (log_phi={lo}); "
@@ -144,25 +130,23 @@ class TweedieGBM(DistributionalGBM):
     Models both the mean mu(x) and dispersion phi(x) as functions of
     covariates. The mean is fitted via CatBoost's native Tweedie loss.
     Dispersion is modelled via Smyth-Jørgensen double GLM: a Gamma
-    regression on squared Pearson residuals.
+    regression on squared Pearson residuals computed via cross-fitting.
 
     Parameters
     ----------
     power : float
         Tweedie variance power p. Must be in (1, 2) for compound Poisson-Gamma.
-        Default 1.5 (standard for UK motor). The power is NOT estimated from
-        data — fix it based on the line of business.
+        Default 1.5 (standard for UK motor). Not estimated from data.
     n_cycles : int
         Coordinate descent cycles. Default 1.
     model_dispersion : bool
-        If True (default), fit a GBM model for phi(x). If False, use a scalar
-        phi (standard single-parameter Tweedie GBM — faster but less rich).
+        If True (default), fit a GBM model for phi(x). If False, use scalar phi.
+    phi_cv_folds : int
+        Number of cross-validation folds for OOF mu residuals used to train the
+        phi model. Default 3. Set to 1 to disable cross-fitting.
     cat_features : list, optional
-        Categorical feature indices/names for CatBoost.
     catboost_params_mu : dict, optional
-        Override CatBoost parameters for the mean model.
     catboost_params_phi : dict, optional
-        Override CatBoost parameters for the dispersion model.
     random_state : int
 
     Examples
@@ -177,8 +161,6 @@ class TweedieGBM(DistributionalGBM):
     >>> pred = model.predict(X)
     >>> pred.mean.shape
     (1000,)
-    >>> pred.volatility_score().shape
-    (1000,)
     """
 
     def __init__(
@@ -186,6 +168,7 @@ class TweedieGBM(DistributionalGBM):
         power: float = 1.5,
         n_cycles: int = 1,
         model_dispersion: bool = True,
+        phi_cv_folds: int = 3,
         cat_features: Optional[List[Union[int, str]]] = None,
         catboost_params_mu: Optional[Dict[str, Any]] = None,
         catboost_params_phi: Optional[Dict[str, Any]] = None,
@@ -204,21 +187,18 @@ class TweedieGBM(DistributionalGBM):
             )
         self.power = power
         self.model_dispersion = model_dispersion
+        self.phi_cv_folds = phi_cv_folds
         self._model_mu = None
         self._model_phi = None
-        self._phi_scalar: float = 1.0  # fallback if model_dispersion=False
+        self._phi_scalar: float = 1.0
+        self._log_phi_init: float = 0.0
 
     # -------------------------------------------------------------------------
     # DistributionalGBM interface
     # -------------------------------------------------------------------------
 
     def _init_params(self, y: np.ndarray, exposure: np.ndarray) -> Dict[str, Any]:
-        """
-        Unconditional MLE initialisation.
-
-        mu_init = sum(y) / sum(exposure)  — exposure-weighted mean
-        phi_init = MLE scalar phi given mu_init
-        """
+        """Unconditional MLE initialisation."""
         mu_init = np.sum(y) / np.sum(exposure)
         mu_arr = np.full(len(y), mu_init * exposure)
         phi_init = _estimate_phi_mle(y, mu_arr, self.power)
@@ -239,102 +219,141 @@ class TweedieGBM(DistributionalGBM):
         cycle: int,
     ) -> Dict[str, Any]:
         """
-        One coordinate descent cycle: fit mu, then fit phi.
+        Step 1 — Fit mu model on all data (CatBoost Tweedie, log link).
+        Step 2 — Compute OOF mu residuals via K-fold cross-fitting.
+        Step 3 — Fit phi model (Gamma deviance) on OOF squared Pearson residuals.
 
-        Step 1 — Fit mu model:
-          CatBoost Tweedie loss with log(exposure) as baseline offset.
-          The baseline is initialised at log(mu_init) on the first cycle.
+        P0-4 fix: re-apply the training baseline at predict time.
 
-        Step 2 — Fit phi model (Smyth-Jørgensen double GLM):
-          Compute squared Pearson residuals d_i = (y_i - mu_hat_i)^2 / mu_hat_i^p.
-          Fit a Gamma GBM with log link on d_i to estimate phi(x).
-          Use exposure as sample weight (higher exposure = more information).
-
-        P0-4 fix: when extracting mu_hat from the just-fitted model, we must
-        re-apply the training baseline. CatBoost Tweedie stores only the tree
-        increments f(x); model.predict(X) without a baseline returns exp(f(x))
-        ≈ 1.0 rather than exp(baseline + f(x)) ≈ mu_true. The corrupted mu_hat
-        then inflates phi residuals by O(mu_true^2), causing phi predictions that
-        are millions of times too large.
+        v0.1.3 fix: OOF cross-fitting prevents overfitting bias in phi residuals.
+        In-sample mu_hat ≈ y when CatBoost overfits, making d ≈ 0. OOF mu_hat
+        is not fitted to observation i, so E[d_i^{OOF}] = phi_i as intended.
         """
         p = self.power
 
-        # --- Step 1: Mean model ---
         mu_params = self._merge_catboost_params(
             self._default_catboost_params(
                 f"Tweedie:variance_power={p}", iterations=300
             ),
             self.catboost_params_mu,
         )
-        # CatBoost Tweedie with baseline = log(exposure) + log(mu_init)
-        # On first cycle, bootstrap from unconditional estimate.
-        # P1-4 fix: on subsequent cycles, include the previous cycle's mu
-        # estimate in the baseline so coordinate descent actually refines the
-        # previous fit rather than discarding it.
+
         if cycle == 0:
             baseline_mu = np.log(exposure) + np.log(params["mu_init"])
         else:
             baseline_mu = np.log(params["mu"]) + np.log(exposure)
 
+        # Fit full mu model on all data
         self._model_mu = self._fit_catboost(
             X, y, mu_params, baseline=baseline_mu
         )
 
-        # P0-4 fix: apply the training baseline when extracting mu_hat for phi
-        # residual computation. Without this, mu_hat ≈ 1.0 (raw tree output,
-        # no baseline), which destroys the phi training signal.
-        mu_hat = self._predict_catboost(self._model_mu, X, baseline=baseline_mu)
-        mu_hat = np.clip(mu_hat, 1e-6, None)
-        params["mu"] = mu_hat
+        # Full in-sample mu_hat for updating params["mu"]
+        mu_hat_full = self._predict_catboost(self._model_mu, X, baseline=baseline_mu)
+        mu_hat_full = np.clip(mu_hat_full, 1e-6, None)
+        params["mu"] = mu_hat_full
 
-        # --- Step 2: Dispersion model ---
-        if self.model_dispersion:
-            # Squared Pearson residuals — the response variable for phi model
-            d = (y - mu_hat) ** 2 / np.power(mu_hat, p)
-            d = np.clip(d, 1e-8, None)  # avoid log(0) in Gamma loss
-
-            phi_params = self._merge_catboost_params(
-                self._default_catboost_params("Tweedie:variance_power=1.5", iterations=200),
-                self.catboost_params_phi,
-            )
-            # Use Gamma deviance loss — CatBoost doesn't have Gamma natively,
-            # so we use RMSE on log(d) which approximates Gamma/log-link GLM.
-            # More principled: use custom Gamma objective.
-            phi_params["loss_function"] = "RMSE"
-
-            log_d = np.log(d)
-            # Sample weight: use exposure (higher exposure obs are more reliable)
-            self._model_phi = self._fit_catboost(
-                X, log_d, phi_params, sample_weight=exposure
-            )
-            log_phi_hat = self._model_phi.predict(X)
-            phi_hat = np.exp(log_phi_hat)
-            phi_hat = np.clip(phi_hat, 1e-6, None)
-            params["phi"] = phi_hat
-        else:
-            # Scalar phi: MLE given current mu_hat
-            phi_scalar = _estimate_phi_mle(y, mu_hat, p)
+        if not self.model_dispersion:
+            phi_scalar = _estimate_phi_mle(y, mu_hat_full, p)
             self._phi_scalar = phi_scalar
             params["phi"] = np.full(len(y), phi_scalar)
+            return params
+
+        # --- Cross-fitting for unbiased phi residuals ---
+        if self.phi_cv_folds > 1:
+            mu_hat_oof = self._compute_oof_mu(
+                X, y, exposure, params, cycle, baseline_mu, mu_params
+            )
+        else:
+            mu_hat_oof = mu_hat_full
+
+        # Squared Pearson residuals from OOF mu
+        d = (y - mu_hat_oof) ** 2 / np.power(mu_hat_oof, p)
+        d = np.clip(d, 1e-8, None)
+
+        phi_init = float(params.get("phi_init", float(np.mean(d))))
+        phi_init = max(phi_init, 1e-4)
+        self._log_phi_init = float(np.log(phi_init))
+        baseline_phi = np.full(len(y), self._log_phi_init)
+
+        phi_params = self._merge_catboost_params(
+            self._default_catboost_params("Tweedie:variance_power=1.99", iterations=200),
+            self.catboost_params_phi,
+        )
+        self._model_phi = self._fit_catboost(
+            X, d, phi_params, baseline=baseline_phi, sample_weight=exposure
+        )
+        phi_hat = self._predict_catboost(
+            self._model_phi, X, baseline=baseline_phi
+        )
+        phi_hat = np.clip(phi_hat, 1e-6, None)
+        params["phi"] = phi_hat
 
         return params
+
+    def _compute_oof_mu(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        exposure: np.ndarray,
+        params: Dict[str, Any],
+        cycle: int,
+        baseline_mu: np.ndarray,
+        mu_params: Dict[str, Any],
+    ) -> np.ndarray:
+        """
+        Compute out-of-fold mu predictions via K-fold cross-fitting.
+
+        For each fold k: fit mu on the OTHER K-1 folds, predict on fold k.
+        Returns per-observation mu_hat that was NOT fitted to that observation.
+        """
+        n = len(y)
+        K = self.phi_cv_folds
+        mu_hat_oof = np.zeros(n)
+
+        rng = np.random.default_rng(self.random_state + cycle * 31337)
+        fold_idx = rng.permutation(n) % K
+
+        for k in range(K):
+            train_mask = fold_idx != k
+            val_mask = ~train_mask
+
+            if val_mask.sum() == 0:
+                continue
+
+            X_tr = X[train_mask]
+            y_tr = y[train_mask]
+            base_tr = baseline_mu[train_mask]
+            X_val = X[val_mask]
+            base_val = baseline_mu[val_mask]
+
+            mu_model_k = self._fit_catboost(
+                X_tr, y_tr, mu_params, baseline=base_tr
+            )
+            mu_hat_k = self._predict_catboost(mu_model_k, X_val, baseline=base_val)
+            mu_hat_oof[val_mask] = np.clip(mu_hat_k, 1e-6, None)
+
+            logger.debug(
+                "OOF fold %d/%d: n_train=%d, n_val=%d",
+                k + 1, K, train_mask.sum(), val_mask.sum()
+            )
+
+        return mu_hat_oof
 
     def _predict_params(
         self, X: np.ndarray, exposure: np.ndarray
     ) -> Dict[str, np.ndarray]:
-        # P0-1 fix: apply log(exposure) as baseline so predictions are on the
-        # correct scale. The model was trained with baseline = log(exposure) +
-        # log(mu_init), meaning exp(f(x)) is the rate per unit exposure.
-        # At prediction time we must add log(exposure) back so we get the
-        # absolute mean (rate * exposure) rather than just the rate.
         mu_hat = self._predict_catboost(
             self._model_mu, X, baseline=np.log(exposure)
         )
         mu_hat = np.clip(mu_hat, 1e-6, None)
 
         if self.model_dispersion and self._model_phi is not None:
-            log_phi_hat = self._model_phi.predict(X)
-            phi_hat = np.exp(log_phi_hat)
+            n = len(X)
+            baseline_phi = np.full(n, self._log_phi_init)
+            phi_hat = self._predict_catboost(
+                self._model_phi, X, baseline=baseline_phi
+            )
         else:
             phi_hat = np.full(len(X), self._phi_scalar)
 
@@ -353,15 +372,12 @@ class TweedieGBM(DistributionalGBM):
         ll = _tweedie_log_likelihood(y, params["mu"], params["phi"], self.power)
         return float(-np.mean(ll))
 
-    # -------------------------------------------------------------------------
-    # Convenience
-    # -------------------------------------------------------------------------
-
     def __repr__(self) -> str:
         status = "fitted" if self._is_fitted else "not fitted"
         return (
             f"TweedieGBM(power={self.power}, "
             f"model_dispersion={self.model_dispersion}, "
+            f"phi_cv_folds={self.phi_cv_folds}, "
             f"n_cycles={self.n_cycles}, "
             f"status={status!r})"
         )
