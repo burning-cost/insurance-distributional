@@ -87,19 +87,20 @@ log_mu = (
 mu_true = np.exp(log_mu)
 phi_true = 0.5 + 0.02 * vehicle_age  # older vehicles -> more dispersed losses
 
-# Simulate Tweedie (compound Poisson-Gamma) outcomes
-# Approach: Y = sum of `counts` Gamma(shape=1, scale=gamma_scale) variates per observation.
-# NOTE: shape=1 (Exponential severity) is exact only for p=1.5. For other values of p,
-# the individual severity shape parameter is alpha = (2-p)/(p-1), not 1.
-# At p=1.5: alpha = (2-1.5)/(1.5-1) = 0.5/0.5 = 1 (Exponential). Correct.
-# At p=1.7: alpha = (2-1.7)/(1.7-1) = 0.3/0.7 ≈ 0.43. The simulation below would
-# be incorrect for p != 1.5 -- use scipy.stats.tweedie or a proper compound-Poisson
-# sampler for other power values.
-lam = mu_true ** (2 - 1.5) / (phi_true * (2 - 1.5))  # Poisson parameter
+# Simulate Tweedie (compound Poisson-Gamma) outcomes: correct compound Poisson approach.
+# For Tweedie(p), individual claim severity ~ Gamma(alpha, beta) where:
+#   alpha = (2-p)/(p-1)   [shape of each individual claim]
+#   lambda = mu^(2-p) / (phi*(2-p))   [Poisson claim count parameter]
+# Y_i = sum of `count_i` independent Gamma(alpha, beta_i) draws.
+# At p=1.5: alpha = (2-1.5)/(1.5-1) = 0.5/0.5 = 1.0 (Exponential severity).
+p_tweedie = 1.5
+alpha_sev = (2 - p_tweedie) / (p_tweedie - 1)  # = 1.0 for p=1.5
+lam = mu_true ** (2 - p_tweedie) / (phi_true * (2 - p_tweedie))  # Poisson parameter
 counts = rng.poisson(lam)
-gamma_scale = mu_true / lam  # severity scale (Exponential: shape=1 assumed)
+# Individual severity mean = mu / lambda; scale = mean / alpha
+beta_sev = mu_true / (lam * alpha_sev)
 y = np.array([
-    rng.gamma(c, gamma_scale[i]) if c > 0 else 0.0
+    rng.gamma(alpha_sev, beta_sev[i], size=c).sum() if c > 0 else 0.0
     for i, c in enumerate(counts)
 ])
 exposure = rng.uniform(0.5, 1.0, n)
@@ -212,7 +213,7 @@ pred.r         # overdispersion size parameter
 
 **Gamma (mu, phi):**
 - `mu`: expected severity
-- `phi = 1/shape`: dispersion. CoV = sqrt(phi). phi=0.25 means shape=4, CoV=0.5.
+- `phi = 1/shape`: dispersion (`phi` here is the GLM canonical dispersion parameter, equal to 1/shape for the Gamma — not the shape parameter itself). CoV = sqrt(phi). phi=0.25 means shape=4, CoV=0.5.
 
 **ZIP (lambda, pi):**
 - `lambda`: Poisson rate for the non-inflated component
@@ -251,7 +252,7 @@ The volatility score (CoV per risk) is the key output beyond the mean. UK pricin
 1. **Safety loading**: P = mu * (1 + k * CoV) where k is the risk appetite parameter.
 2. **Underwriter referrals**: Flag risks where CoV exceeds a threshold.
 3. **Reinsurance**: Identify segments that drive tail exposure.
-4. **IFRS 17**: Risk adjustment is proportional to uncertainty - CoV provides the input.
+4. **IFRS 17 risk adjustment (variance-based approach)**: per-risk CoV provides an input to variance-proportional RA methods. Other approaches (quantile, cost of capital, CTE) are more common in practice.
 5. **Capital allocation**: High-CoV risks consume more SCR per unit of premium.
 
 No commercial pricing tool (Emblem, Radar, Guidewire) currently outputs CoV per risk. This library fills that gap.
