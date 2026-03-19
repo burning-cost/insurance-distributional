@@ -3,6 +3,7 @@
 [![PyPI](https://img.shields.io/pypi/v/insurance-distributional)](https://pypi.org/project/insurance-distributional/)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![License: MIT](https://img.shields.io/badge/license-MIT-green)
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/burning-cost/insurance-distributional/blob/main/notebooks/quickstart.ipynb)
 
 Distributional gradient boosting for insurance pricing. Models the full conditional distribution of losses - not just the mean - so you get a coefficient of variation per risk, not just E[Y|x].
 
