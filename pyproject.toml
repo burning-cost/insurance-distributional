@@ -27,13 +27,13 @@ dependencies = [
 
 [project.optional-dependencies]
 plots = ["matplotlib>=3.6"]
-dev = ["pytest>=7.0", "pytest-cov", "numpy>=1.24", "polars>=1.0"]
+dev = ["pytest>=7.0", "pytest-cov", "numpy>=1.24", "polars>=1.0", "pdoc>=14.0.0"]
 
 [project.urls]
 Homepage = "https://github.com/burning-cost/insurance-distributional"
 Repository = "https://github.com/burning-cost/insurance-distributional"
 "Bug Tracker" = "https://github.com/burning-cost/insurance-distributional/issues"
-Documentation = "https://github.com/burning-cost/insurance-distributional#readme"
+Documentation = "https://burning-cost.github.io/insurance-distributional/"
 
 [build-system]
 requires = ["hatchling"]
