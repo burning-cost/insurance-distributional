@@ -315,7 +315,68 @@ def gini_index(
     y_lorenz = cum_y / total_y
 
     # Area under Lorenz curve via trapezoid rule
-    auc = float(np.trapezoid(y_lorenz, x_lorenz)) if hasattr(np, "trapezoid") else float(np.trapz(y_lorenz, x_lorenz))
+    auc = float(np.trapezoid(y_lorenz, x_lorenz))
     # Gini = 1 - 2*AUC: good model concentrates losses at high scores (end of
     # ascending sort), Lorenz curve below diagonal, AUC < 0.5, Gini > 0.
     return 1.0 - 2.0 * auc
+
+
+# ---------------------------------------------------------------------------
+# CDE scoring utilities (for FlexCodeDensity)
+# ---------------------------------------------------------------------------
+
+
+def cde_loss(
+    cdes: np.ndarray,
+    z_grid: np.ndarray,
+    z_test: np.ndarray,
+) -> float:
+    """
+    CDE loss (conditional density estimation loss, Gneiting & Raftery 2007).
+
+    L = E[integral f_hat(z|X)^2 dz] - 2 * E[f_hat(Z|X)]
+
+    Strictly proper: minimised uniquely by the true conditional density.
+    Used to tune the number of basis functions in FlexCodeDensity.
+
+    Parameters
+    ----------
+    cdes : np.ndarray, shape (n_test, n_grid)
+        Predicted conditional density values on z_grid for each test obs.
+    z_grid : np.ndarray, shape (n_grid,)
+        Grid of z values at which cdes are evaluated.
+    z_test : np.ndarray, shape (n_test,)
+        True z-values (transformed targets) for test observations.
+
+    Returns
+    -------
+    float
+        CDE loss. Lower is better.
+
+    Notes
+    -----
+    z_test should be in the same space as z_grid. If the model uses
+    log_transform=True, pass z_test = log(y_test + epsilon).
+    """
+    cdes = np.asarray(cdes, dtype=np.float64)
+    z_grid = np.asarray(z_grid, dtype=np.float64)
+    z_test = np.asarray(z_test, dtype=np.float64)
+
+    if cdes.ndim != 2:
+        raise ValueError(f"cdes must be 2D (n_test, n_grid), got shape {cdes.shape}")
+    if cdes.shape[1] != len(z_grid):
+        raise ValueError(
+            f"cdes.shape[1]={cdes.shape[1]} must match len(z_grid)={len(z_grid)}"
+        )
+
+    # term1: E[integral f_hat(z|X)^2 dz]
+    term1 = float(np.mean(np.trapezoid(cdes ** 2, z_grid, axis=1)))
+
+    # term2: E[f_hat(z_true | X)] — density evaluated at the true test point
+    n_test = len(z_test)
+    term2_vals = np.empty(n_test)
+    for i in range(n_test):
+        term2_vals[i] = float(np.interp(z_test[i], z_grid, cdes[i]))
+    term2 = float(np.mean(term2_vals))
+
+    return term1 - 2.0 * term2
