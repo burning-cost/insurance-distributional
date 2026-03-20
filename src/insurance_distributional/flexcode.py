@@ -161,24 +161,26 @@ class FlexCodePrediction:
         cdf = np.clip(cdf, 0.0, 1.0)
 
         n_obs = self.cdes.shape[0]
+        n_grid = len(self.y_grid)
         result = np.empty((n_obs, len(q_arr)))
 
         # Vectorise over quantile levels (5-10 iterations), not observations
-        # (potentially 10k+ iterations). For each quantile level q, np.interp
-        # is called once with the full (n_obs,) batch.
+        # (potentially 10k+ iterations). For each quantile level qi, we find
+        # the grid index where cdf[i, :] first reaches qi for every row i.
+        # Note: np.searchsorted only works on 1D arrays in numpy<2.0, so we
+        # use np.argmax on the boolean matrix (cdf >= qi) instead.
         for j, qi in enumerate(q_arr):
-            # For each observation, find where CDF crosses qi.
-            # np.interp does piecewise linear interpolation per row.
-            # We want: for row i, interp(qi, cdf[i], y_grid)
-            # Vectorised equivalent: search across columns (grid axis) for each row.
-            # Use searchsorted on the transposed CDF.
-            idx = np.searchsorted(cdf, qi, side="left")  # (n_obs,), index along grid
-            idx = np.clip(idx, 1, len(self.y_grid) - 1)
+            above = cdf >= qi  # (n_obs, n_grid), True where CDF has reached qi
+            # argmax returns first True index per row; 0 if no True (all below)
+            idx = np.argmax(above, axis=1)  # (n_obs,)
+            # If CDF never reaches qi (beyond grid), hold at last grid point
+            all_below = ~above.any(axis=1)
+            idx = np.where(all_below, n_grid - 1, idx)
+            idx = np.clip(idx, 1, n_grid - 1)  # ensure idx-1 is valid
             y_lo = self.y_grid[idx - 1]
             y_hi = self.y_grid[idx]
             c_lo = cdf[np.arange(n_obs), idx - 1]
             c_hi = cdf[np.arange(n_obs), idx]
-            # Linear interpolation: weight = (qi - c_lo) / (c_hi - c_lo)
             denom = c_hi - c_lo
             safe_denom = np.where(denom > 0, denom, 1.0)
             w = np.clip((qi - c_lo) / safe_denom, 0.0, 1.0)
