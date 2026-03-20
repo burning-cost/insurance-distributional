@@ -159,9 +159,26 @@ class FlexCodePrediction:
         n_obs = self.cdes.shape[0]
         result = np.empty((n_obs, len(q_arr)))
 
-        for i in range(n_obs):
-            for j, qi in enumerate(q_arr):
-                result[i, j] = float(np.interp(qi, cdf[i], self.y_grid))
+        # Vectorise over quantile levels (5-10 iterations), not observations
+        # (potentially 10k+ iterations). For each quantile level q, np.interp
+        # is called once with the full (n_obs,) batch.
+        for j, qi in enumerate(q_arr):
+            # For each observation, find where CDF crosses qi.
+            # np.interp does piecewise linear interpolation per row.
+            # We want: for row i, interp(qi, cdf[i], y_grid)
+            # Vectorised equivalent: search across columns (grid axis) for each row.
+            # Use searchsorted on the transposed CDF.
+            idx = np.searchsorted(cdf, qi, side="left")  # (n_obs,), index along grid
+            idx = np.clip(idx, 1, len(self.y_grid) - 1)
+            y_lo = self.y_grid[idx - 1]
+            y_hi = self.y_grid[idx]
+            c_lo = cdf[np.arange(n_obs), idx - 1]
+            c_hi = cdf[np.arange(n_obs), idx]
+            # Linear interpolation: weight = (qi - c_lo) / (c_hi - c_lo)
+            denom = c_hi - c_lo
+            safe_denom = np.where(denom > 0, denom, 1.0)
+            w = np.clip((qi - c_lo) / safe_denom, 0.0, 1.0)
+            result[:, j] = y_lo + w * (y_hi - y_lo)
 
         if scalar:
             return result[:, 0]
@@ -272,8 +289,18 @@ class FlexCodePrediction:
 
         n_obs = self.cdes.shape[0]
         pit = np.empty(n_obs)
-        for i in range(n_obs):
-            pit[i] = float(np.interp(y_obs[i], self.y_grid, cdf[i]))
+        # Vectorised: for each observation i, find where y_obs[i] falls in y_grid
+        # and interpolate the CDF value there. Avoids n_obs separate np.interp calls.
+        idx = np.searchsorted(self.y_grid, y_obs, side="left")  # (n_obs,)
+        idx = np.clip(idx, 1, len(self.y_grid) - 1)
+        y_lo = self.y_grid[idx - 1]
+        y_hi = self.y_grid[idx]
+        c_lo = cdf[np.arange(n_obs), idx - 1]
+        c_hi = cdf[np.arange(n_obs), idx]
+        denom = y_hi - y_lo
+        safe_denom = np.where(denom > 0, denom, 1.0)
+        w = np.clip((y_obs - y_lo) / safe_denom, 0.0, 1.0)
+        pit = np.clip(c_lo + w * (c_hi - c_lo), 0.0, 1.0)
         return pit
 
     def cde_loss(self, y_obs: np.ndarray) -> float:
@@ -299,9 +326,19 @@ class FlexCodePrediction:
 
         term1 = float(np.mean(np.trapezoid(self.cdes ** 2, self.y_grid, axis=1)))
 
-        term2_vals = np.empty(n)
-        for i in range(n):
-            term2_vals[i] = float(np.interp(y_obs[i], self.y_grid, self.cdes[i]))
+        # Vectorised density interpolation: same approach as pit_values()
+        delta_y2 = np.diff(self.y_grid)
+        f_mid2 = 0.5 * (self.cdes[:, :-1] + self.cdes[:, 1:])
+        idx2 = np.searchsorted(self.y_grid, y_obs, side="left")
+        idx2 = np.clip(idx2, 1, len(self.y_grid) - 1)
+        y_lo2 = self.y_grid[idx2 - 1]
+        y_hi2 = self.y_grid[idx2]
+        d_lo2 = self.cdes[np.arange(n), idx2 - 1]
+        d_hi2 = self.cdes[np.arange(n), idx2]
+        denom2 = y_hi2 - y_lo2
+        safe_denom2 = np.where(denom2 > 0, denom2, 1.0)
+        w2 = np.clip((y_obs - y_lo2) / safe_denom2, 0.0, 1.0)
+        term2_vals = d_lo2 + w2 * (d_hi2 - d_lo2)
         term2 = float(np.mean(term2_vals))
 
         return term1 - 2.0 * term2
@@ -460,6 +497,20 @@ class FlexCodeDensity:
                 "FlexCodeDensity with log_transform=True requires y > 0. "
                 f"Found {(y_np <= 0).sum()} non-positive values. "
                 "Filter zeros before fitting (apply to severity only, not Tweedie pure premium)."
+            )
+
+        # Guard against silently wrong log-transform when log_epsilon is too large
+        # for the data scale. For claims in pence (sub-unit), log_epsilon=1.0 (default)
+        # compresses most of the loss distribution near zero and produces unreliable densities.
+        if self.log_transform and float(y_np.min()) < self.log_epsilon:
+            warnings.warn(
+                f"log_epsilon={self.log_epsilon} is larger than the minimum observed "
+                f"y ({float(y_np.min()):.4g}). For sub-unit losses (e.g. claims in pence "
+                "or normalised losses in [0,1]), set log_epsilon to a fraction of the minimum "
+                "loss — e.g. log_epsilon=0.01. Using log_epsilon=1.0 with sub-unit data "
+                "compresses most of the distribution and will produce inaccurate densities.",
+                UserWarning,
+                stacklevel=2,
             )
 
         logger.info(
