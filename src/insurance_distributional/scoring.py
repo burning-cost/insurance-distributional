@@ -24,6 +24,10 @@ from typing import Optional, Tuple
 
 import numpy as np
 
+# numpy<2.0 compat: trapezoid was added in 2.0, trapz deprecated in 2.0
+if not hasattr(np, 'trapezoid'):
+    np.trapezoid = np.trapz  # type: ignore[attr-defined]
+
 
 # ---------------------------------------------------------------------------
 # Deviance metrics (standard actuarial)

@@ -47,6 +47,10 @@ from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
 
+# numpy<2.0 compat: trapezoid was added in 2.0, trapz deprecated in 2.0
+if not hasattr(np, 'trapezoid'):
+    np.trapezoid = np.trapz  # type: ignore[attr-defined]
+
 from .basis import cosine_basis, evaluate_density, postprocess_density
 from .base import _to_1d, _to_numpy
 
