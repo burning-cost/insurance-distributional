@@ -366,11 +366,100 @@ The "safety loading spread" ratio in the output script shows a spuriously large 
 
 ---
 
+
+---
+
+## FlexCodeDensity
+
+**New in v0.2.0.** Nonparametric conditional density estimation f(y|x) using the FlexCode series expansion (Izbicki & Lee, 2017). Gives you the full conditional distribution — quantiles, XL layer expected values, tail probabilities — without assuming a parametric tail (no GPD, no threshold selection).
+
+The density is estimated as a finite cosine-basis expansion:
+
+    f(y|x) = Σ_{k=1}^{I} β_k(x) · φ_k(y)
+
+where each β_k(x) is learned by CatBoost MultiRMSE regression — one model for all I basis functions simultaneously. The log-transform handles right-skewed severity: fitting in Z = log(y + ε) space requires far fewer basis functions.
+
+**When to use this instead of EQRN:** FlexCode is simpler when the training data covers the pricing layer (motor OD, property, home). EQRN (in `insurance_quantile.eqrn`) is better for lines where the worst historical claim is not a credible upper bound on future losses (motor BI, liability).
+
+```python
+import numpy as np
+from insurance_distributional import FlexCodeDensity
+
+rng = np.random.default_rng(42)
+n_train, n_test = 8_000, 1_000
+
+vehicle_age   = rng.integers(1, 15, n_train + n_test).astype(float)
+driver_age    = rng.integers(21, 75, n_train + n_test).astype(float)
+ncd_years     = rng.integers(0, 9, n_train + n_test).astype(float)
+vehicle_group = rng.choice([1.0, 2.0, 3.0, 4.0], size=n_train + n_test)
+
+# Heteroskedastic lognormal severity (tail weight varies by vehicle group)
+log_mu    = 7.2 + 0.03 * vehicle_age - 0.008 * ncd_years + 0.15 * vehicle_group
+log_sigma = 0.45 + 0.06 * vehicle_group
+y_sev = np.exp(rng.normal(log_mu, log_sigma))  # severity only (positive losses)
+
+X = np.column_stack([vehicle_age, driver_age, ncd_years, vehicle_group])
+X_train, X_test = X[:n_train], X[n_train:]
+y_train = y_sev[:n_train]
+
+# Fit FlexCode conditional density
+model = FlexCodeDensity(
+    max_basis=30,        # number of cosine basis functions
+    log_transform=True,  # essential for right-skewed severity (default)
+    n_grid=250,          # density grid points for integration
+)
+model.fit(X_train, y_train)
+
+# Tune: select optimal number of basis functions by CDE loss on a validation set
+model.tune(X_test, y_sev[n_train:])
+# model.best_basis_ is set automatically
+
+# Full conditional density (n_test, n_grid)
+pred = model.predict_density(X_test)
+pred.cdes      # density values, shape (n_test, n_grid)
+pred.y_grid    # y-axis in original scale
+
+# Conditional quantiles — no GPD assumption
+q95 = pred.quantile(0.95)       # shape (n_test,)
+q99 = pred.quantile(0.99)
+
+# Or use the shortcut method directly
+q95_direct = model.predict_quantile(X_test, q=0.95)
+
+# XL layer expected value: E[loss in (£100k xs £400k) | X]
+# This is what a reinsurance underwriter wants for a £400k xs £100k layer
+layer_ev = model.price_layer(X_test, attachment=100_000, limit=400_000)
+
+# Scoring
+model.crps(X_test, y_sev[n_train:])      # CRPS (lower is better)
+model.log_score(X_test, y_sev[n_train:]) # mean negative log-likelihood
+
+# PIT histogram for calibration diagnostics
+pit = pred.pit_values(y_sev[n_train:])  # should be uniform if well-calibrated
+```
+
+```
+FlexCodeDensity params:
+  max_basis       — 30 for smooth unimodal severity, 50+ for bimodal or heavy tails
+  log_transform   — True by default; set False only for count data or when y can be negative
+  log_epsilon     — continuity correction for log transform (default 1.0, for £ claims)
+                    For sub-unit losses, set to a fraction of the minimum observed loss
+  n_grid          — density grid resolution (200 is fine, 500+ for sharp tails)
+  z_max_override  — override the automatic upper bound; use when pricing layers
+                    that extend beyond the observed maximum (in log-space)
+```
+
+**Key advantage over parametric GBMs:** FlexCodeDensity makes no shape assumption. If motor BI severity changes from roughly Gamma near the mean to something heavier-tailed at high values — and the tails differ across vehicle groups — FlexCode learns that directly from the data rather than forcing a Gamma or Tweedie shape.
+
+**Limitation:** Does not extrapolate beyond the training data range. If your XL layer extends beyond the historical maximum loss, use `EQRNModel` from `insurance_quantile.eqrn` for a GPD tail that extrapolates. The two can be spliced: FlexCode for the body of the distribution, GPD for the extreme tail.
+
+
 ## References
 
 - So & Valdez (2024). *Zero-Inflated Tweedie Boosted Trees with CatBoost for Insurance Loss Analytics*. Applied Soft Computing. doi:10.1016/j.asoc.2025.113226. arXiv 2406.16206. **ASTIN Best Paper 2024.**
 - Smyth & Jorgensen (2002). *Fitting Tweedie's Compound Poisson Model to Insurance Claims Data: Dispersion Modelling*. ASTIN Bulletin 32(1):143-157.
 - Chevalier & Cote (2025). *From point to probabilistic gradient boosting for claim frequency and severity prediction*. European Actuarial Journal. doi:10.1007/s13385-025-00428-5.
+- Izbicki, R. and Lee, A.B. (2017). Converting high-dimensional regression to high-dimensional conditional density estimation. Electronic Journal of Statistics 11(2), 2800-2831.
 - Rigby & Stasinopoulos (2005). *Generalized Additive Models for Location, Scale and Shape*. Journal of the Royal Statistical Society Series C, 54(3):507-554.
 
 ---

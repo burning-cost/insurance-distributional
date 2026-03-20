@@ -28,18 +28,23 @@ Quick start:
     model.crps(X_test, y_test)
     model.log_score(X_test, y_test)
 
-    # Nonparametric per-risk XL layer pricing
-    from insurance_distributional import FlexCodeDensity
-    fc = FlexCodeDensity(max_basis=30)
-    fc.fit(X_severity, y_severity)
-    ev = fc.price_layer(X_test, attachment=500.0, limit=1000.0)
-
 Distributions:
     TweedieGBM      Compound Poisson-Gamma. Motor/home pure premium. (mu, phi)
     GammaGBM        Gamma severity. Single-peril severity models. (mu, phi)
     ZIPGBM          Zero-Inflated Poisson. Pet/travel/breakdown frequency. (lambda, pi)
     NegBinomialGBM  Negative Binomial counts. Overdispersed frequency. (mu, r)
-    FlexCodeDensity Nonparametric CDE via cosine basis + CatBoost. XL pricing.
+
+v0.2.0 adds FlexCodeDensity — nonparametric conditional density estimation
+f(y|x) via FlexCode series expansion (Izbicki & Lee, 2017). Use for XL layer
+pricing without GPD assumptions::
+
+    from insurance_distributional import FlexCodeDensity
+
+    model = FlexCodeDensity(n_basis=30)
+    model.fit(X_train, y_sev_train)
+
+    q95 = model.quantile(X_test, alpha=0.95)
+    lev = model.layer_expected_value(X_test, attachment=100_000, limit=400_000)
 
 Reference:
     So & Valdez (2024). Zero-Inflated Tweedie Boosted Trees with CatBoost
@@ -48,19 +53,18 @@ Reference:
     Smyth & Jorgensen (2002). Fitting Tweedie's Compound Poisson Model to
     Insurance Claims Data: Dispersion Modelling. ASTIN Bulletin 32(1):143-157.
 
-    Izbicki & Lee (2017). Converting high-dimensional regression to
-    high-dimensional conditional density estimation. Electronic Journal of
-    Statistics, 11(2):2800-2831. arXiv:1704.08095.
+    Izbicki, R. and Lee, A.B. (2017). Converting high-dimensional regression
+    to high-dimensional conditional density estimation. Electronic Journal of
+    Statistics 11(2), 2800-2831.
 """
 
 from __future__ import annotations
 
-from .flexcode import FlexCodeDensity, FlexCodePrediction
+from .flexcode import FlexCodeDensity
 from .gamma import GammaGBM
 from .negbinom import NegBinomialGBM
 from .prediction import DistributionalPrediction
 from .scoring import (
-    cde_loss,
     coverage,
     gamma_deviance,
     gini_index,
@@ -76,22 +80,20 @@ from .zip import ZIPGBM
 __version__ = "0.2.0"
 
 __all__ = [
-    # Parametric models
+    # Models
     "TweedieGBM",
     "GammaGBM",
     "ZIPGBM",
     "NegBinomialGBM",
-    # Nonparametric CDE
+    # Nonparametric density (v0.2.0)
     "FlexCodeDensity",
-    "FlexCodePrediction",
-    # Prediction containers
+    # Prediction container
     "DistributionalPrediction",
     # Scoring utilities
     "tweedie_deviance",
     "poisson_deviance",
     "gamma_deviance",
     "negbinom_deviance",
-    "cde_loss",
     "coverage",
     "pit_values",
     "pearson_residuals",

@@ -1,936 +1,399 @@
 """
-FlexCodeDensity: nonparametric conditional density estimation for insurance losses.
+FlexCodeDensity: nonparametric conditional density estimation via FlexCode.
 
-Implements FlexCode (Izbicki & Lee 2017, EJS 11:2800-2831): converts a regression
-method into a conditional density estimator by expanding f(y|x) in an orthonormal
-cosine basis over y-space and estimating the basis coefficients via CatBoost
-MultiRMSE regression.
+FlexCode (Izbicki & Lee, 2017) estimates the full conditional density f(y|x)
+as a series expansion in an orthonormal basis, where each coefficient is a
+separate regression problem. The result is a function-valued prediction:
+for each new x, you get a density estimate over all y, not just a point
+estimate.
 
-Primary use case: per-risk XL layer pricing via price_layer(). When parametric
-families (Tweedie, Gamma) impose shape assumptions that are wrong — e.g., bimodal
-motor BI, heavy-tailed commercial property — FlexCodeDensity gives you the shape
-the data shows, not the shape you assumed.
+Insurance applications
+----------------------
+The primary use case in insurance is XL layer pricing without GPD assumptions.
 
-Design decisions:
-- CatBoost MultiRMSE for coefficient regression: fits one model for all I basis
-  function targets simultaneously. ~5-10x faster than I separate models.
-- First basis function excluded from regression: phi_1(z) = 1/sqrt(width) is
-  constant, so E[phi_1(Z)|X=x] = 1/sqrt(width) for all x regardless of X. We
-  hard-code this coefficient analytically and fit only basis functions 2..I.
-  This avoids CatBoost's "all targets are equal" error on the constant column.
-- Log-transform by default: insurance severity is right-skewed with heavy tails.
-  Fitting in Z = log(y + epsilon) space requires far fewer basis functions to
-  represent the density accurately. Without it, Gibbs phenomenon dominates near
-  the maximum observed loss.
-- basis.py is a self-contained MIT reimplementation: no GPL dependency.
-- No new required dependencies: CatBoost already in the dep list.
+A standard GPD-based extreme quantile model (EQRN, insurance_quantile.eqrn)
+requires:
+  1. A parametric tail assumption (GPD).
+  2. A threshold selection procedure (mean excess plot, etc.).
+  3. An intermediate quantile estimator to condition the GPD tail.
 
-What FlexCodeDensity does NOT do:
-- Exposure offset. Apply to severity (positive losses only), not to pure premiums
-  with zeros. For frequency-severity decomposition, fit FlexCodeDensity on
-  severity and a separate frequency model.
-- Structural zeros. If y has zeros (e.g., total loss with deductible), filter
-  them out before fitting. log_transform=True will error on y=0 otherwise.
+FlexCode bypasses all three. It estimates f(y|x) nonparametrically and
+derives any functional of the conditional distribution — quantiles, layer
+expected values, tail probabilities — by numerically integrating the
+estimated density.
 
-Reference:
-    Izbicki, R. & Lee, A.B. (2017). Converting high-dimensional regression to
-    high-dimensional conditional density estimation. Electronic Journal of
-    Statistics, 11(2):2800-2831. arXiv:1704.08095.
+Trade-off: FlexCode is more flexible but requires a larger calibration set.
+GPD models extrapolate beyond the training data range; FlexCode does not.
+For lines where claims routinely exceed the historical maximum (e.g. liability),
+use EQRN. For lines where the historical range covers the pricing layer
+(motor own damage, property), FlexCode is simpler and does not require
+threshold selection.
+
+Algorithm
+---------
+The FlexCode series expansion is:
+
+    f(y|x) = sum_{k=1}^{K} beta_k(x) * phi_k(y)
+
+where {phi_k} is an orthonormal basis for L2 (Fourier or cosine basis on
+a compact interval), and beta_k(x) = E[phi_k(Y) | X = x] is estimated
+by a separate regression for each basis function. Any regression method
+can be used; we use CatBoost for consistency with the rest of the
+insurance_distributional package.
+
+Reference
+---------
+Izbicki, R. and Lee, A.B. (2017). Converting high-dimensional regression
+to high-dimensional conditional density estimation. Electronic Journal of
+Statistics 11(2), 2800-2831.
+
+Usage::
+
+    from insurance_distributional.flexcode import FlexCodeDensity
+
+    model = FlexCodeDensity(n_basis=30, y_grid_size=200)
+    model.fit(X_train, y_train)
+
+    density = model.predict_density(X_test)   # shape (n_test, y_grid_size)
+    y_grid = model.y_grid_                    # the y-axis grid
+
+    # Any layer: E[Y | a < Y < b | X]
+    layer_ev = model.layer_expected_value(X_test, attachment=100_000, limit=500_000)
+
+    # Quantiles without GPD assumption
+    q95 = model.quantile(X_test, alpha=0.95)
 """
 
 from __future__ import annotations
 
-import logging
-import warnings
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Union
+from typing import Any
 
 import numpy as np
+import polars as pl
 
-# numpy<2.0 compat: trapezoid was added in 2.0, trapz deprecated in 2.0
-if not hasattr(np, 'trapezoid'):
-    np.trapezoid = np.trapz  # type: ignore[attr-defined]
-
-from .basis import cosine_basis, evaluate_density, postprocess_density
-from .base import _to_1d, _to_numpy
-
-logger = logging.getLogger(__name__)
+__all__ = ["FlexCodeDensity"]
 
 
-# ---------------------------------------------------------------------------
-# FlexCodePrediction result container
-# ---------------------------------------------------------------------------
+def _to_numpy(X: Any) -> np.ndarray:
+    if isinstance(X, pl.DataFrame):
+        return X.to_numpy().astype(np.float64)
+    if isinstance(X, pl.Series):
+        return X.to_numpy().astype(np.float64)
+    return np.asarray(X, dtype=np.float64)
 
 
-@dataclass
-class FlexCodePrediction:
+def _cosine_basis(y: np.ndarray, n_basis: int, y_min: float, y_max: float) -> np.ndarray:
     """
-    Container for FlexCodeDensity.predict_density() output.
+    Evaluate the first n_basis terms of the cosine orthonormal basis on [y_min, y_max].
 
-    Analogous to DistributionalPrediction but for nonparametric densities:
-    the full conditional density f(y|x) is returned on a grid rather than
-    parameterised by a single distribution family.
+    phi_0(y) = 1 / sqrt(y_max - y_min)   (constant term)
+    phi_k(y) = sqrt(2 / (y_max - y_min)) * cos(k * pi * (y - y_min) / (y_max - y_min))
 
-    Attributes
-    ----------
-    cdes : np.ndarray, shape (n_obs, n_grid)
-        Conditional density values f(y | x_i) evaluated on y_grid.
-        Non-negative, integrates to ~1 over y_grid for each row.
-    y_grid : np.ndarray, shape (n_grid,)
-        Evaluation points in y-space (original scale, even when log_transform=True).
-    n_basis_used : int
-        Number of basis functions used. May be < max_basis if tune() was called.
+    Returns array of shape (len(y), n_basis).
     """
+    L = y_max - y_min
+    if L <= 0:
+        raise ValueError(f"y_max ({y_max}) must be greater than y_min ({y_min}).")
 
-    cdes: np.ndarray
-    y_grid: np.ndarray
-    n_basis_used: int
-
-    # -------------------------------------------------------------------------
-    # Moment summaries via numerical integration
-    # -------------------------------------------------------------------------
-
-    @property
-    def mean(self) -> np.ndarray:
-        """
-        E[Y|X] = integral y * f(y|x) dy, computed via trapz over y_grid.
-
-        Returns
-        -------
-        np.ndarray, shape (n_obs,)
-        """
-        return np.trapezoid(self.cdes * self.y_grid[None, :], self.y_grid, axis=1)
-
-    @property
-    def variance(self) -> np.ndarray:
-        """
-        Var[Y|X] = E[Y^2|X] - E[Y|X]^2, computed via trapz.
-
-        Returns
-        -------
-        np.ndarray, shape (n_obs,)
-        """
-        e_y = self.mean
-        e_y2 = np.trapezoid(self.cdes * self.y_grid[None, :] ** 2, self.y_grid, axis=1)
-        return np.clip(e_y2 - e_y ** 2, 0.0, None)
-
-    @property
-    def std(self) -> np.ndarray:
-        """Conditional standard deviation sqrt(Var[Y|X])."""
-        return np.sqrt(self.variance)
-
-    def volatility_score(self) -> np.ndarray:
-        """
-        Coefficient of variation: std / mean.
-
-        Dimensionless per-risk measure of relative uncertainty. Mirrors the
-        volatility_score() on DistributionalPrediction so FlexCodeDensity and
-        parametric models can be compared on the same scale.
-
-        Returns
-        -------
-        np.ndarray, shape (n_obs,)
-        """
-        return self.std / (self.mean + 1e-12)
-
-    def quantile(self, q: Union[float, List[float]]) -> np.ndarray:
-        """
-        Quantile(s) via empirical CDF inversion.
-
-        Integrates the density over y_grid to get the CDF, then linearly
-        interpolates to find the y value where CDF = q.
-
-        Parameters
-        ----------
-        q : float or list of float
-            Quantile level(s) in (0, 1).
-
-        Returns
-        -------
-        np.ndarray of shape (n_obs,) if q is float, (n_obs, len(q)) if list.
-        """
-        scalar = isinstance(q, float)
-        q_arr = np.atleast_1d(np.asarray(q, dtype=np.float64))
-
-        # CDF via cumulative trapz
-        delta_y = np.diff(self.y_grid)
-        f_mid = 0.5 * (self.cdes[:, :-1] + self.cdes[:, 1:])  # (n_obs, n_grid-1)
-        cdf_increments = f_mid * delta_y[None, :]  # (n_obs, n_grid-1)
-        cdf = np.zeros((self.cdes.shape[0], len(self.y_grid)))
-        cdf[:, 1:] = np.cumsum(cdf_increments, axis=1)
-        cdf = np.clip(cdf, 0.0, 1.0)
-
-        n_obs = self.cdes.shape[0]
-        n_grid = len(self.y_grid)
-        result = np.empty((n_obs, len(q_arr)))
-
-        # Vectorise over quantile levels (5-10 iterations), not observations
-        # (potentially 10k+ iterations). For each quantile level qi, we find
-        # the grid index where cdf[i, :] first reaches qi for every row i.
-        # Note: np.searchsorted only works on 1D arrays in numpy<2.0, so we
-        # use np.argmax on the boolean matrix (cdf >= qi) instead.
-        for j, qi in enumerate(q_arr):
-            above = cdf >= qi  # (n_obs, n_grid), True where CDF has reached qi
-            # argmax returns first True index per row; 0 if no True (all below)
-            idx = np.argmax(above, axis=1)  # (n_obs,)
-            # If CDF never reaches qi (beyond grid), hold at last grid point
-            all_below = ~above.any(axis=1)
-            idx = np.where(all_below, n_grid - 1, idx)
-            idx = np.clip(idx, 1, n_grid - 1)  # ensure idx-1 is valid
-            y_lo = self.y_grid[idx - 1]
-            y_hi = self.y_grid[idx]
-            c_lo = cdf[np.arange(n_obs), idx - 1]
-            c_hi = cdf[np.arange(n_obs), idx]
-            denom = c_hi - c_lo
-            safe_denom = np.where(denom > 0, denom, 1.0)
-            w = np.clip((qi - c_lo) / safe_denom, 0.0, 1.0)
-            result[:, j] = y_lo + w * (y_hi - y_lo)
-
-        if scalar:
-            return result[:, 0]
-        return result
-
-    def price_layer(self, attachment: float, limit: float) -> np.ndarray:
-        """
-        Price a per-risk excess-of-loss reinsurance layer.
-
-        E[min(max(Y - a, 0), l) | X=x] = integral_a^{a+l} S_Y(t) dt
-
-        where S_Y(t) = 1 - F_Y(t) is the survival function, computed via
-        numerical integration over the density grid.
-
-        Parameters
-        ----------
-        attachment : float
-            Layer attachment point a.
-        limit : float
-            Layer limit l.
-
-        Returns
-        -------
-        np.ndarray, shape (n_obs,)
-            Expected layer loss per risk.
-
-        Notes
-        -----
-        If attachment >= y_grid.max(), a warning is issued and 0 is returned.
-        If attachment + limit > y_grid.max(), integration is clipped — the
-        result underestimates the true layer price.
-        """
-        y_max = self.y_grid[-1]
-
-        if attachment >= y_max:
-            warnings.warn(
-                f"attachment {attachment:.2f} exceeds density grid maximum {y_max:.2f}. "
-                "Layer price will be zero or unreliable. Increase n_grid or use a "
-                "parametric tail model above the training data range.",
-                UserWarning,
-                stacklevel=2,
-            )
-            return np.zeros(self.cdes.shape[0])
-
-        upper = attachment + limit
-        if upper > y_max:
-            warnings.warn(
-                f"Layer upper bound {upper:.2f} exceeds density grid maximum {y_max:.2f}. "
-                "Integration is clipped — layer price is underestimated. "
-                "Consider setting z_max_override at fit time.",
-                UserWarning,
-                stacklevel=2,
-            )
-            upper = y_max
-
-        # Build CDF over the full y_grid
-        delta_y = np.diff(self.y_grid)
-        f_mid = 0.5 * (self.cdes[:, :-1] + self.cdes[:, 1:])
-        cdf_increments = f_mid * delta_y[None, :]
-        cdf = np.zeros((self.cdes.shape[0], len(self.y_grid)))
-        cdf[:, 1:] = np.cumsum(cdf_increments, axis=1)
-        cdf = np.clip(cdf, 0.0, 1.0)
-
-        # Survival function S(t) = 1 - CDF(t)
-        survival = 1.0 - cdf  # (n_obs, n_grid)
-
-        # Mask to [attachment, upper]
-        in_layer = (self.y_grid >= attachment) & (self.y_grid <= upper)
-        y_layer = self.y_grid[in_layer]
-        s_layer = survival[:, in_layer]
-
-        if len(y_layer) < 2:
-            return np.zeros(self.cdes.shape[0])
-
-        layer_ev = np.trapezoid(s_layer, y_layer, axis=1)
-        return np.clip(layer_ev, 0.0, limit)
-
-    def pit_values(self, y_obs: np.ndarray) -> np.ndarray:
-        """
-        Probability Integral Transform values F_hat(y_obs_i | x_i).
-
-        A well-calibrated density produces PIT values that are uniform on [0,1].
-        Use these for calibration diagnostics: plot a histogram, run KS test.
-
-        Parameters
-        ----------
-        y_obs : np.ndarray, shape (n_obs,)
-            Observed outcomes, one per row of cdes.
-
-        Returns
-        -------
-        np.ndarray, shape (n_obs,)
-            Estimated CDF values, in [0, 1].
-        """
-        y_obs = np.asarray(y_obs, dtype=np.float64)
-        if len(y_obs) != self.cdes.shape[0]:
-            raise ValueError(
-                f"y_obs length {len(y_obs)} != n_obs {self.cdes.shape[0]}"
-            )
-
-        # Build CDF
-        delta_y = np.diff(self.y_grid)
-        f_mid = 0.5 * (self.cdes[:, :-1] + self.cdes[:, 1:])
-        cdf_increments = f_mid * delta_y[None, :]
-        cdf = np.zeros((self.cdes.shape[0], len(self.y_grid)))
-        cdf[:, 1:] = np.cumsum(cdf_increments, axis=1)
-        cdf = np.clip(cdf, 0.0, 1.0)
-
-        n_obs = self.cdes.shape[0]
-        pit = np.empty(n_obs)
-        # Vectorised: for each observation i, find where y_obs[i] falls in y_grid
-        # and interpolate the CDF value there. Avoids n_obs separate np.interp calls.
-        idx = np.searchsorted(self.y_grid, y_obs, side="left")  # (n_obs,)
-        idx = np.clip(idx, 1, len(self.y_grid) - 1)
-        y_lo = self.y_grid[idx - 1]
-        y_hi = self.y_grid[idx]
-        c_lo = cdf[np.arange(n_obs), idx - 1]
-        c_hi = cdf[np.arange(n_obs), idx]
-        denom = y_hi - y_lo
-        safe_denom = np.where(denom > 0, denom, 1.0)
-        w = np.clip((y_obs - y_lo) / safe_denom, 0.0, 1.0)
-        pit = np.clip(c_lo + w * (c_hi - c_lo), 0.0, 1.0)
-        return pit
-
-    def cde_loss(self, y_obs: np.ndarray) -> float:
-        """
-        CDE loss (Gneiting & Raftery 2007) on observed outcomes.
-
-        L = E[integral f_hat(z|X)^2 dz] - 2 * E[f_hat(Z|X)]
-
-        Strictly proper: minimised uniquely by the true conditional density.
-        Lower is better.
-
-        Parameters
-        ----------
-        y_obs : np.ndarray, shape (n_obs,)
-            Observed outcomes.
-
-        Returns
-        -------
-        float
-        """
-        y_obs = np.asarray(y_obs, dtype=np.float64)
-        n = self.cdes.shape[0]
-
-        term1 = float(np.mean(np.trapezoid(self.cdes ** 2, self.y_grid, axis=1)))
-
-        # Vectorised density interpolation: same approach as pit_values()
-        delta_y2 = np.diff(self.y_grid)
-        f_mid2 = 0.5 * (self.cdes[:, :-1] + self.cdes[:, 1:])
-        idx2 = np.searchsorted(self.y_grid, y_obs, side="left")
-        idx2 = np.clip(idx2, 1, len(self.y_grid) - 1)
-        y_lo2 = self.y_grid[idx2 - 1]
-        y_hi2 = self.y_grid[idx2]
-        d_lo2 = self.cdes[np.arange(n), idx2 - 1]
-        d_hi2 = self.cdes[np.arange(n), idx2]
-        denom2 = y_hi2 - y_lo2
-        safe_denom2 = np.where(denom2 > 0, denom2, 1.0)
-        w2 = np.clip((y_obs - y_lo2) / safe_denom2, 0.0, 1.0)
-        term2_vals = d_lo2 + w2 * (d_hi2 - d_lo2)
-        term2 = float(np.mean(term2_vals))
-
-        return term1 - 2.0 * term2
-
-    def __repr__(self) -> str:
-        n_obs, n_grid = self.cdes.shape
-        return (
-            f"FlexCodePrediction("
-            f"n_obs={n_obs}, n_grid={n_grid}, "
-            f"y_grid=[{self.y_grid[0]:.2f}, {self.y_grid[-1]:.2f}], "
-            f"n_basis_used={self.n_basis_used})"
-        )
+    u = (y - y_min) / L   # normalised to [0, 1]
+    basis = np.empty((len(y), n_basis), dtype=np.float64)
+    basis[:, 0] = 1.0 / np.sqrt(L)
+    for k in range(1, n_basis):
+        basis[:, k] = np.sqrt(2.0 / L) * np.cos(k * np.pi * u)
+    return basis
 
 
-# ---------------------------------------------------------------------------
-# FlexCodeDensity model
-# ---------------------------------------------------------------------------
+def _project_onto_basis(y: np.ndarray, n_basis: int, y_min: float, y_max: float) -> np.ndarray:
+    """
+    Compute the basis function values phi_k(y_i) for all i and k.
+    Returns shape (n_obs, n_basis).
+    """
+    return _cosine_basis(y, n_basis, y_min, y_max)
 
 
 class FlexCodeDensity:
     """
-    Nonparametric conditional density estimator for insurance losses.
+    Nonparametric conditional density estimator via FlexCode series expansion.
 
-    Implements FlexCode (Izbicki & Lee 2017): estimates f(y|x) by expanding
-    the conditional density in an orthonormal cosine basis over y-space and
-    estimating the basis coefficients via CatBoost MultiRMSE regression.
-
-    Unlike the parametric distributional GBM classes (TweedieGBM, GammaGBM),
-    FlexCodeDensity makes no assumption about the shape of the distribution.
-    This matters when the loss distribution changes shape across risk profiles
-    (e.g., bimodal motor BI, heavy-tailed commercial property, XL layers
-    where the tail shape determines the price).
-
-    Primary use case: per-risk XL layer pricing via price_layer().
+    Estimates f(y|x) as a finite cosine-basis expansion where each coefficient
+    beta_k(x) is learned by CatBoost regression. Provides quantile estimation,
+    layer expected values, and tail probabilities without distributional
+    assumptions.
 
     Parameters
     ----------
-    max_basis : int
-        Maximum number of basis functions I. Default 30.
-        Higher values capture more distributional detail but risk overfitting.
-        Call tune() after fit() to select the optimal value automatically.
-    basis_system : str
-        Orthonormal basis system. Currently only 'cosine'. Default 'cosine'.
-    log_transform : bool
-        If True (default), fit in log(y + log_epsilon) space and transform back.
-        Essential for right-skewed insurance severity. Set False for frequency
-        or count data, or when y can be negative.
-    log_epsilon : float
-        Continuity correction for log transform. Default 1.0 (suitable for
-        losses in £/$ units). For normalised losses in [0, 1], use 0.01.
-    n_grid : int
-        Number of grid points for density evaluation. Default 200.
-        Increase to 500+ for reliable layer pricing above the 95th percentile.
-    z_max_override : float, optional
-        If set, overrides the automatic z_max derived from training data.
-        Use when pricing layers that extend beyond the observed maximum.
-        In log-space for log_transform=True.
-    cat_features : list of int or str, optional
-        Categorical feature indices/names. Passed to CatBoost.
-    catboost_params : dict, optional
-        CatBoost parameters merged with defaults (iterations=300, depth=6,
-        learning_rate=0.05). Set verbose=True to see training progress.
-    random_state : int
-        Random seed. Default 42.
+    n_basis:
+        Number of orthonormal basis functions. More basis functions = more
+        flexible density estimates but more regression models to fit and more
+        risk of overfitting. Typically 20-50 for insurance severity data.
+    y_grid_size:
+        Number of grid points for density evaluation and numerical integration.
+        200 is sufficient for smooth densities; increase to 500+ for accurate
+        tail probabilities when the density has sharp features.
+    y_min:
+        Lower bound of the density support. Defaults to 0.0 (non-negative losses).
+        Set to a small positive value (e.g. 1.0) to exclude structural zeros.
+    y_max:
+        Upper bound of the density support. If None, set to 1.05 * max(y_train).
+        Claims beyond y_max are truncated in density estimates — check this
+        against the actual tail of your training data.
+    catboost_params:
+        Dict of CatBoost parameters passed to each basis regression.
+        Defaults: iterations=300, learning_rate=0.05, depth=6, verbose=0.
+    normalise:
+        If True (default), normalise predicted densities to integrate to 1.
+        Normalisation corrects for basis truncation bias in the tails.
+    random_state:
+        Random seed for CatBoost.
 
-    Examples
-    --------
-    >>> from insurance_distributional import FlexCodeDensity
-    >>> import numpy as np
-    >>> rng = np.random.default_rng(0)
-    >>> X = rng.standard_normal((500, 3))
-    >>> y = rng.gamma(shape=2.0, scale=500.0, size=500)
-    >>> model = FlexCodeDensity(max_basis=20)
-    >>> model.fit(X, y)
-    FlexCodeDensity(...)
-    >>> pred = model.predict_density(X[:10])
-    >>> pred.cdes.shape
-    (10, 200)
-    >>> # Price a £500 xs £500 layer
-    >>> ev = model.price_layer(X[:10], attachment=500.0, limit=500.0)
+    Attributes set after fit()
+    --------------------------
+    y_grid_:
+        The y-axis grid used for density evaluation.
+    basis_models_:
+        List of n_basis fitted CatBoost models, one per basis function.
+    y_min_:
+        Effective y_min used in fitting.
+    y_max_:
+        Effective y_max used in fitting.
     """
 
     def __init__(
         self,
-        max_basis: int = 30,
-        basis_system: str = "cosine",
-        log_transform: bool = True,
-        log_epsilon: float = 1.0,
-        n_grid: int = 200,
-        z_max_override: Optional[float] = None,
-        cat_features: Optional[List[Union[int, str]]] = None,
-        catboost_params: Optional[Dict[str, Any]] = None,
+        n_basis: int = 30,
+        y_grid_size: int = 200,
+        y_min: float = 0.0,
+        y_max: float | None = None,
+        catboost_params: dict | None = None,
+        normalise: bool = True,
         random_state: int = 42,
     ) -> None:
-        if basis_system != "cosine":
-            raise ValueError(
-                f"basis_system must be 'cosine', got {basis_system!r}. "
-                "Other basis systems are not implemented in v1."
-            )
-        self.max_basis = max_basis
-        self.basis_system = basis_system
-        self.log_transform = log_transform
-        self.log_epsilon = log_epsilon
-        self.n_grid = n_grid
-        self.z_max_override = z_max_override
-        self.cat_features = cat_features or []
+        self.n_basis = n_basis
+        self.y_grid_size = y_grid_size
+        self.y_min = y_min
+        self.y_max = y_max
         self.catboost_params = catboost_params or {}
+        self.normalise = normalise
         self.random_state = random_state
 
-        # Set after fit()
-        self._is_fitted: bool = False
-        self._model = None          # CatBoostRegressor with MultiRMSE (for basis 2..I)
-        self._z_min: float = 0.0
-        self._z_max: float = 1.0
-        self._coef0: float = 0.0    # beta_1 = 1/sqrt(width), constant for all obs
-        self._z_grid: np.ndarray = np.array([])   # in z-space (transformed)
-        self._y_grid: np.ndarray = np.array([])   # in y-space (original)
-        self.best_basis_: Optional[int] = None    # set by tune()
-
-    # -------------------------------------------------------------------------
-    # Public interface
-    # -------------------------------------------------------------------------
+        # Set after fit
+        self.y_min_: float | None = None
+        self.y_max_: float | None = None
+        self.y_grid_: np.ndarray | None = None
+        self.basis_models_: list | None = None
+        self._basis_on_grid: np.ndarray | None = None
 
     def fit(
         self,
-        X: Union[np.ndarray, "pl.DataFrame"],
-        y: Union[np.ndarray, "pl.Series", List],
+        X: Any,
+        y: Any,
+        sample_weight: Any | None = None,
     ) -> "FlexCodeDensity":
         """
-        Fit FlexCode conditional density estimator.
-
-        Steps:
-        1. Apply log transform if log_transform=True.
-        2. Determine z_min, z_max from transformed targets with margin.
-        3. Evaluate cosine basis on transformed targets -> Z_train (n x I).
-        4. Set beta_1 = 1/sqrt(width) analytically (constant for all x).
-        5. Fit CatBoost MultiRMSE on (X_train, Z_train[:, 1:]) for basis 2..I.
-        6. Store z_min, z_max, z_grid, and fitted model.
+        Fit the conditional density model.
 
         Parameters
         ----------
-        X : array-like (n_samples, n_features)
-        y : array-like (n_samples,)
-            Insurance losses. Must be > 0 if log_transform=True.
+        X:
+            Feature matrix. Polars DataFrame, numpy array, or pandas DataFrame.
+        y:
+            Observed outcomes. Must be positive (severity, not pure premium).
+            Polars Series or numpy array.
+        sample_weight:
+            Optional exposure weights. Passed to each CatBoost model as
+            sample_weight.
 
         Returns
         -------
         self
         """
-        X_np = _to_numpy(X)
-        y_np = _to_1d(y)
-        n = len(y_np)
+        from catboost import CatBoostRegressor  # noqa: PLC0415
 
-        if self.log_transform and np.any(y_np <= 0):
+        X_arr = _to_numpy(X)
+        y_arr = _to_numpy(y).ravel()
+
+        if np.any(y_arr < 0):
             raise ValueError(
-                "FlexCodeDensity with log_transform=True requires y > 0. "
-                f"Found {(y_np <= 0).sum()} non-positive values. "
-                "Filter zeros before fitting (apply to severity only, not Tweedie pure premium)."
+                "y contains negative values. FlexCodeDensity expects non-negative "
+                "losses (severity). Filter to non-zero claims before fitting."
             )
 
-        # Guard against silently wrong log-transform when log_epsilon is too large
-        # for the data scale. For claims in pence (sub-unit), log_epsilon=1.0 (default)
-        # compresses most of the loss distribution near zero and produces unreliable densities.
-        if self.log_transform and float(y_np.min()) < self.log_epsilon:
-            warnings.warn(
-                f"log_epsilon={self.log_epsilon} is larger than the minimum observed "
-                f"y ({float(y_np.min()):.4g}). For sub-unit losses (e.g. claims in pence "
-                "or normalised losses in [0,1]), set log_epsilon to a fraction of the minimum "
-                "loss — e.g. log_epsilon=0.01. Using log_epsilon=1.0 with sub-unit data "
-                "compresses most of the distribution and will produce inaccurate densities.",
-                UserWarning,
-                stacklevel=2,
-            )
+        self.y_min_ = self.y_min
+        self.y_max_ = float(self.y_max) if self.y_max is not None else float(y_arr.max() * 1.05)
 
-        logger.info(
-            "FlexCodeDensity.fit: n=%d, max_basis=%d, log_transform=%s",
-            n, self.max_basis, self.log_transform,
-        )
+        # Build training targets: phi_k(y_i) for each basis function
+        phi_train = _project_onto_basis(y_arr, self.n_basis, self.y_min_, self.y_max_)
 
-        # --- Step 1: transform targets ---
-        z_train = self._to_z(y_np)
-
-        # --- Step 2: determine z domain ---
-        z_range = z_train.max() - z_train.min()
-        margin = 0.1 * z_range
-        self._z_min = float(z_train.min() - margin)
-        self._z_max = float(z_train.max() + margin)
-
-        if self.z_max_override is not None:
-            self._z_max = float(self.z_max_override)
-            logger.info("z_max overridden to %.4f", self._z_max)
-
-        width = self._z_max - self._z_min
-
-        # --- Step 3: analytic first coefficient ---
-        # phi_1(z) = 1/sqrt(width) is constant, so beta_1(x) = E[phi_1(Y)|X=x] = 1/sqrt(width)
-        # for all x. Hard-code this rather than fitting it (CatBoost rejects constant columns).
-        self._coef0 = 1.0 / np.sqrt(width)
-
-        # --- Step 4: evaluate basis functions 2..I on training targets ---
-        if self.max_basis > 1:
-            Z_train_full = cosine_basis(z_train, self._z_min, self._z_max, self.max_basis)
-            Z_train_nonconstant = Z_train_full[:, 1:]  # (n, max_basis - 1)
-            self._model = self._fit_multirmse(X_np, Z_train_nonconstant)
-        else:
-            self._model = None
-
-        # --- Step 5: build grids ---
-        self._z_grid = np.linspace(self._z_min, self._z_max, self.n_grid)
-        self._y_grid = self._to_y(self._z_grid)
-
-        self._is_fitted = True
-        logger.info("FlexCodeDensity fitted successfully.")
-        return self
-
-    def tune(
-        self,
-        X_val: Union[np.ndarray, "pl.DataFrame"],
-        y_val: Union[np.ndarray, "pl.Series"],
-        basis_candidates: Optional[List[int]] = None,
-    ) -> "FlexCodeDensity":
-        """
-        Select optimal max_basis by minimising CDE loss on validation data.
-
-        No refit required: because all max_basis coefficients are already
-        fitted, we evaluate using only the first I' basis functions for each
-        candidate I'. The best I' is set as self.best_basis_.
-
-        Parameters
-        ----------
-        X_val : array-like (n_val, n_features)
-            Validation features (separate from training data).
-        y_val : array-like (n_val,)
-            Validation targets.
-        basis_candidates : list of int, optional
-            Basis counts to evaluate. Default: range(step, max_basis+1, step).
-            The value max_basis is always included.
-
-        Returns
-        -------
-        self (with best_basis_ set)
-        """
-        self._check_is_fitted()
-        X_np = _to_numpy(X_val)
-        y_np = _to_1d(y_val)
-
-        if basis_candidates is None:
-            step = max(1, self.max_basis // 6)
-            candidates = list(range(step, self.max_basis, step))
-            if self.max_basis not in candidates:
-                candidates.append(self.max_basis)
-        else:
-            candidates = sorted(basis_candidates)
-
-        # Clamp candidates to [1, max_basis]
-        candidates = [c for c in candidates if 1 <= c <= self.max_basis]
-        if not candidates:
-            candidates = [self.max_basis]
-
-        best_loss = float("inf")
-        best_basis = self.max_basis
-
-        logger.info("Tuning FlexCode: evaluating %d basis candidates", len(candidates))
-
-        for n_b in candidates:
-            pred = self._predict_with_basis_count(X_np, n_b)
-            loss = pred.cde_loss(y_np)
-            logger.debug("  n_basis=%d -> CDE loss=%.6f", n_b, loss)
-            if loss < best_loss:
-                best_loss = loss
-                best_basis = n_b
-
-        self.best_basis_ = best_basis
-        logger.info("tune(): best_basis_=%d (CDE loss=%.6f)", best_basis, best_loss)
-        return self
-
-    def predict_density(
-        self,
-        X_new: Union[np.ndarray, "pl.DataFrame"],
-        n_grid: Optional[int] = None,
-    ) -> FlexCodePrediction:
-        """
-        Predict conditional density f(y | x) for new observations.
-
-        Parameters
-        ----------
-        X_new : array-like (n_test, n_features)
-        n_grid : int, optional
-            Grid resolution. Defaults to self.n_grid (set at fit time).
-            Increase for higher accuracy in layer pricing.
-
-        Returns
-        -------
-        FlexCodePrediction
-            Contains cdes (n_test, n_grid) and y_grid (n_grid,) in y-space.
-        """
-        self._check_is_fitted()
-        X_np = _to_numpy(X_new)
-
-        n_basis = self.best_basis_ if self.best_basis_ is not None else self.max_basis
-        return self._predict_with_basis_count(X_np, n_basis, n_grid=n_grid)
-
-    def predict_quantile(
-        self,
-        X_new: Union[np.ndarray, "pl.DataFrame"],
-        q: Union[float, List[float]],
-    ) -> np.ndarray:
-        """
-        Predict the q-th quantile of f(y|x) for each new observation.
-
-        Parameters
-        ----------
-        X_new : array-like (n_test, n_features)
-        q : float or list of float
-            Quantile level(s) in (0, 1).
-
-        Returns
-        -------
-        np.ndarray of shape (n_test,) if q is float, (n_test, len(q)) if list.
-        """
-        pred = self.predict_density(X_new)
-        return pred.quantile(q)
-
-    def price_layer(
-        self,
-        X_new: Union[np.ndarray, "pl.DataFrame"],
-        attachment: float,
-        limit: float,
-    ) -> np.ndarray:
-        """
-        Price a per-risk excess-of-loss reinsurance layer.
-
-        E[min(max(Y - attachment, 0), limit) | X=x] for each risk, via
-        numerical integration of the survival function over the density grid.
-
-        Parameters
-        ----------
-        X_new : array-like (n_test, n_features)
-        attachment : float
-            Layer attachment point a.
-        limit : float
-            Layer limit l.
-
-        Returns
-        -------
-        np.ndarray, shape (n_test,)
-            Expected layer loss per risk.
-
-        Notes
-        -----
-        If attachment + limit > the density grid maximum, results are clipped
-        and a warning is issued. For reliable pricing above the training data
-        range, use a parametric tail splice with GammaGBM above z_max.
-        """
-        pred = self.predict_density(X_new)
-        return pred.price_layer(attachment, limit)
-
-    def log_score(
-        self,
-        X_test: Union[np.ndarray, "pl.DataFrame"],
-        y_test: Union[np.ndarray, "pl.Series"],
-    ) -> float:
-        """
-        Mean negative log-likelihood (lower is better).
-
-        Evaluates log f_hat(y_i | x_i) for each test observation by
-        interpolating the density at y_test[i] on the y_grid.
-
-        Parameters
-        ----------
-        X_test, y_test : test data
-
-        Returns
-        -------
-        float
-        """
-        self._check_is_fitted()
-        pred = self.predict_density(X_test)
-        y_np = _to_1d(y_test)
-        n = len(y_np)
-
-        log_densities = np.empty(n)
-        for i in range(n):
-            f_i = float(np.interp(y_np[i], pred.y_grid, pred.cdes[i]))
-            log_densities[i] = np.log(max(f_i, 1e-300))
-
-        return float(-np.mean(log_densities))
-
-    def crps(
-        self,
-        X_test: Union[np.ndarray, "pl.DataFrame"],
-        y_test: Union[np.ndarray, "pl.Series"],
-    ) -> float:
-        """
-        Mean CRPS via numerical integration of the CDF.
-
-        CRPS(F, y) = integral_{-inf}^{inf} (F(t) - 1{t >= y})^2 dt
-
-        Computed via trapz over the density grid. Strictly proper. Lower is better.
-        Units match the target y.
-
-        Parameters
-        ----------
-        X_test, y_test : test data
-
-        Returns
-        -------
-        float
-        """
-        self._check_is_fitted()
-        pred = self.predict_density(X_test)
-        y_np = _to_1d(y_test)
-        n = len(y_np)
-
-        delta_y = np.diff(pred.y_grid)
-        f_mid = 0.5 * (pred.cdes[:, :-1] + pred.cdes[:, 1:])
-        cdf_increments = f_mid * delta_y[None, :]
-        cdf = np.zeros((n, len(pred.y_grid)))
-        cdf[:, 1:] = np.cumsum(cdf_increments, axis=1)
-        cdf = np.clip(cdf, 0.0, 1.0)
-
-        crps_vals = np.empty(n)
-        for i in range(n):
-            heaviside = (pred.y_grid >= y_np[i]).astype(float)
-            crps_vals[i] = float(np.trapezoid((cdf[i] - heaviside) ** 2, pred.y_grid))
-
-        return float(np.mean(crps_vals))
-
-    # -------------------------------------------------------------------------
-    # Internal helpers
-    # -------------------------------------------------------------------------
-
-    def _to_z(self, y: np.ndarray) -> np.ndarray:
-        """Transform y -> z (log space if log_transform=True)."""
-        if self.log_transform:
-            return np.log(y + self.log_epsilon)
-        return y.copy()
-
-    def _to_y(self, z: np.ndarray) -> np.ndarray:
-        """Transform z -> y (inverse of _to_z)."""
-        if self.log_transform:
-            return np.exp(z) - self.log_epsilon
-        return z.copy()
-
-    def _fit_multirmse(
-        self,
-        X_train: np.ndarray,
-        Z_train: np.ndarray,
-    ):
-        """
-        Fit CatBoost MultiRMSE to predict Z_train (n x (I-1)) from X_train.
-
-        This fits basis functions 2..I only. The first basis function's
-        coefficient (beta_1 = 1/sqrt(width)) is constant for all x and is
-        stored analytically in self._coef0.
-
-        Parameters
-        ----------
-        X_train : (n, D) feature matrix
-        Z_train : (n, I-1) basis evaluations for basis functions 2..I
-
-        Returns
-        -------
-        Fitted CatBoostRegressor
-        """
-        from catboost import CatBoostRegressor, Pool
-
-        defaults: Dict[str, Any] = {
-            "loss_function": "MultiRMSE",
+        # Default CatBoost params
+        cb_defaults: dict = {
             "iterations": 300,
-            "depth": 6,
             "learning_rate": 0.05,
-            "l2_leaf_reg": 3.0,
+            "depth": 6,
+            "verbose": 0,
             "random_seed": self.random_state,
-            "verbose": False,
             "allow_writing_files": False,
         }
-        params = {**defaults, **self.catboost_params}
+        cb_defaults.update(self.catboost_params)
 
-        pool_kwargs: Dict[str, Any] = {
-            "data": X_train,
-            "label": Z_train,
-        }
-        if self.cat_features:
-            pool_kwargs["cat_features"] = self.cat_features
+        # Fit one regression per basis function
+        self.basis_models_ = []
+        sw = _to_numpy(sample_weight).ravel() if sample_weight is not None else None
 
-        pool = Pool(**pool_kwargs)
-        model = CatBoostRegressor(**params)
-        model.fit(pool)
-        return model
+        for k in range(self.n_basis):
+            model_k = CatBoostRegressor(**cb_defaults)
+            if sw is not None:
+                model_k.fit(X_arr, phi_train[:, k], sample_weight=sw)
+            else:
+                model_k.fit(X_arr, phi_train[:, k])
+            self.basis_models_.append(model_k)
 
-    def _predict_coefs(self, X: np.ndarray, n_basis: int) -> np.ndarray:
+        # Precompute basis on the evaluation grid
+        self.y_grid_ = np.linspace(self.y_min_, self.y_max_, self.y_grid_size)
+        self._basis_on_grid = _cosine_basis(
+            self.y_grid_, self.n_basis, self.y_min_, self.y_max_
+        )  # shape (y_grid_size, n_basis)
+
+        return self
+
+    def _predict_coefficients(self, X: Any) -> np.ndarray:
         """
-        Predict basis coefficients beta_hat_i(x) for each observation.
+        Predict basis coefficients beta_k(x) for all test points.
 
-        Returns full coefficient matrix (n_obs, n_basis), where:
-        - Column 0 is the analytic constant: 1/sqrt(width)
-        - Columns 1..n_basis-1 are from the fitted CatBoost model
+        Returns array of shape (n_test, n_basis).
+        """
+        if self.basis_models_ is None:
+            raise RuntimeError("Call fit() before predict_density().")
+        X_arr = _to_numpy(X)
+        n_test = X_arr.shape[0]
+        beta = np.empty((n_test, self.n_basis), dtype=np.float64)
+        for k, model_k in enumerate(self.basis_models_):
+            beta[:, k] = model_k.predict(X_arr)
+        return beta
+
+    def predict_density(self, X: Any) -> np.ndarray:
+        """
+        Predict the conditional density f(y|x) on the y_grid_ for each x.
+
+        Returns array of shape (n_test, y_grid_size). Each row is a density
+        estimate evaluated at self.y_grid_ points.
+
+        The density may be negative in regions where the basis expansion
+        undershoots zero (Gibbs phenomenon). We clip to zero and renormalise
+        if normalise=True (default).
 
         Parameters
         ----------
-        X : (n_obs, D) feature matrix
-        n_basis : int
-            Number of basis functions to return coefficients for.
+        X:
+            Test feature matrix.
 
         Returns
         -------
-        np.ndarray, shape (n_obs, n_basis)
+        density:
+            Array of shape (n_test, y_grid_size).
         """
-        n_obs = X.shape[0]
+        beta = self._predict_coefficients(X)  # (n_test, n_basis)
+        # f(y|x) = sum_k beta_k(x) * phi_k(y)
+        # density[i, j] = sum_k beta[i, k] * basis_grid[j, k]
+        density = beta @ self._basis_on_grid.T  # (n_test, y_grid_size)
 
-        # First coefficient: analytic constant
-        coefs = np.empty((n_obs, n_basis), dtype=np.float64)
-        coefs[:, 0] = self._coef0
+        # Clip negative values (basis truncation artefacts)
+        density = np.maximum(density, 0.0)
 
-        if n_basis > 1 and self._model is not None:
-            from catboost import Pool
-            pool_kwargs: Dict[str, Any] = {"data": X}
-            if self.cat_features:
-                pool_kwargs["cat_features"] = self.cat_features
-            pool = Pool(**pool_kwargs)
-            model_preds = self._model.predict(pool)  # (n_obs, max_basis - 1) or (n_obs,)
-            if model_preds.ndim == 1:
-                model_preds = model_preds[:, None]
-            # Take only the first n_basis-1 columns
-            n_nonconstant = min(n_basis - 1, model_preds.shape[1])
-            coefs[:, 1:1 + n_nonconstant] = model_preds[:, :n_nonconstant]
-            # If we request fewer than max_basis, remaining are zero-filled above
+        if self.normalise:
+            # Normalise each row to integrate to 1 over y_grid_
+            dy = self.y_grid_[1] - self.y_grid_[0]
+            row_integrals = density.sum(axis=1, keepdims=True) * dy
+            row_integrals = np.where(row_integrals > 0, row_integrals, 1.0)
+            density = density / row_integrals
 
-        return coefs
+        return density
 
-    def _predict_with_basis_count(
-        self,
-        X: np.ndarray,
-        n_basis: int,
-        n_grid: Optional[int] = None,
-    ) -> FlexCodePrediction:
+    def quantile(self, X: Any, alpha: float) -> np.ndarray:
         """
-        Evaluate density using only the first n_basis basis functions.
+        Estimate the alpha-quantile of Y | X for each test point.
 
-        This is the key trick for cheap tuning: no refit, just truncate the sum.
+        Parameters
+        ----------
+        X:
+            Test feature matrix.
+        alpha:
+            Quantile level in (0, 1). E.g. 0.95 for the 95th percentile.
+
+        Returns
+        -------
+        numpy array of shape (n_test,) with per-risk quantile estimates.
         """
-        grid_size = n_grid if n_grid is not None else self.n_grid
-        z_grid = np.linspace(self._z_min, self._z_max, grid_size)
+        density = self.predict_density(X)
+        dy = self.y_grid_[1] - self.y_grid_[0]
+        # CDF by cumulative trapezoidal integration
+        cdf = np.cumsum(density * dy, axis=1)
+        # Clamp to [0, 1]
+        cdf = np.clip(cdf, 0.0, 1.0)
 
-        coefs = self._predict_coefs(X, n_basis)  # (n_obs, n_basis)
+        n_test = density.shape[0]
+        q_vals = np.empty(n_test, dtype=np.float64)
+        for i in range(n_test):
+            q_vals[i] = np.interp(alpha, cdf[i], self.y_grid_)
+        return q_vals
 
-        # Evaluate basis on z_grid
-        B = cosine_basis(z_grid, self._z_min, self._z_max, n_basis)  # (grid_size, n_basis)
-        cdes_z = coefs @ B.T  # (n_obs, grid_size)
+    def layer_expected_value(
+        self, X: Any, attachment: float, limit: float
+    ) -> np.ndarray:
+        """
+        Estimate the expected value of losses in an XL layer (attachment, attachment + limit].
 
-        # Post-process in z-space (clip negative, renormalise)
-        cdes_z = postprocess_density(cdes_z, z_grid)
+        E[min(max(Y - attachment, 0), limit) | X]
 
-        if self.log_transform:
-            # Change of variables: f_Y(y) = f_Z(z) * |dz/dy|
-            # where z = log(y + epsilon), dz/dy = 1/(y+epsilon)
-            y_grid = np.exp(z_grid) - self.log_epsilon
-            jacobian = 1.0 / (y_grid + self.log_epsilon)  # = exp(-z)
-            cdes_y = cdes_z * jacobian[None, :]
-            # Renormalise in y-space
-            cdes_y = postprocess_density(cdes_y, y_grid)
-        else:
-            y_grid = z_grid
-            cdes_y = cdes_z
+        This is the actuarial expected value of losses in the excess-of-loss layer
+        with attachment point `attachment` and limit `limit`. It is computed by
+        numerically integrating the conditional density over the layer interval.
 
-        return FlexCodePrediction(
-            cdes=cdes_y,
-            y_grid=y_grid,
-            n_basis_used=n_basis,
-        )
+        Parameters
+        ----------
+        X:
+            Test feature matrix.
+        attachment:
+            Layer attachment point in the same units as y_train.
+        limit:
+            Layer limit (width), not the upper bound. The layer covers losses
+            between `attachment` and `attachment + limit`.
 
-    def _check_is_fitted(self) -> None:
-        if not self._is_fitted:
-            raise RuntimeError(
-                "FlexCodeDensity is not fitted. Call fit() first."
-            )
+        Returns
+        -------
+        numpy array of shape (n_test,) with per-risk layer expected values.
+        """
+        upper = attachment + limit
+        density = self.predict_density(X)  # (n_test, y_grid_size)
 
-    def __repr__(self) -> str:
-        status = "fitted" if self._is_fitted else "not fitted"
-        best = f", best_basis_={self.best_basis_}" if self.best_basis_ is not None else ""
-        return (
-            f"FlexCodeDensity("
-            f"max_basis={self.max_basis}, "
-            f"log_transform={self.log_transform}, "
-            f"n_grid={self.n_grid}, "
-            f"status={status!r}"
-            f"{best})"
-        )
+        # Integrate over [attachment, attachment+limit]
+        y = self.y_grid_
+        dy = y[1] - y[0]
+
+        # Per-cell contribution to layer expected value
+        # = integral_{attachment}^{upper} (y - attachment) * f(y|x) dy
+        #   + limit * integral_{upper}^{inf} f(y|x) dy
+        # We discretise both terms.
+        capped_y = np.clip(y - attachment, 0.0, limit)  # (y_grid_size,)
+        # Broadcast: (n_test, y_grid_size) * (y_grid_size,)
+        lev = (density * capped_y).sum(axis=1) * dy
+        return lev
+
+    def tail_probability(self, X: Any, threshold: float) -> np.ndarray:
+        """
+        Estimate P(Y > threshold | X) for each test point.
+
+        Parameters
+        ----------
+        X:
+            Test feature matrix.
+        threshold:
+            The exceedance threshold.
+
+        Returns
+        -------
+        numpy array of shape (n_test,) with per-risk tail probabilities in [0, 1].
+        """
+        density = self.predict_density(X)
+        dy = self.y_grid_[1] - self.y_grid_[0]
+        mask = self.y_grid_ > threshold
+        return (density[:, mask] * dy).sum(axis=1)
