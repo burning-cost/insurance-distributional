@@ -48,7 +48,7 @@ Four distribution classes, each following the same fit/predict interface:
 ## Installation
 
 ```bash
-pip install insurance-distributional
+uv add insurance-distributional
 ```
 
 Requires CatBoost, NumPy, Polars, SciPy.
