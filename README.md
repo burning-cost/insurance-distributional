@@ -517,11 +517,13 @@ A ready-to-run Databricks notebook benchmarking this library against standard ap
 
 ## Related Libraries
 
-| Library | What it does |
+| Library | Description |
 |---------|-------------|
+| [insurance-severity](https://github.com/burning-cost/insurance-severity) | Spliced severity distributions and EVT — parametric tail modelling for when you need explicit body/tail decomposition |
 | [insurance-distributional-glm](https://github.com/burning-cost/insurance-distributional-glm) | GAMLSS — extends distributional modelling to let sigma and shape depend on covariates, not just the mean |
 | [insurance-conformal](https://github.com/burning-cost/insurance-conformal) | Conformal prediction — distribution-free alternative when parametric assumptions cannot be verified |
 | [insurance-quantile](https://github.com/burning-cost/insurance-quantile) | Quantile GBM for tail risk — non-parametric alternative for heteroskedastic severity |
+| [shap-relativities](https://github.com/burning-cost/shap-relativities) | Extract rating relativities from GBMs using SHAP |
 
 ## Licence
 
