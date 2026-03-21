@@ -509,12 +509,16 @@ class FlexCodeDensity:
         # for the data scale. For claims in pence (sub-unit), log_epsilon=1.0 (default)
         # compresses most of the loss distribution near zero and produces unreliable densities.
         if self.log_transform and float(y_np.min()) < self.log_epsilon:
+            _y_min = float(y_np.min())
+            _suggested = max(1e-6, _y_min * 1e-3)
             warnings.warn(
                 f"log_epsilon={self.log_epsilon} is larger than the minimum observed "
-                f"y ({float(y_np.min()):.4g}). For sub-unit losses (e.g. claims in pence "
-                "or normalised losses in [0,1]), set log_epsilon to a fraction of the minimum "
-                "loss — e.g. log_epsilon=0.01. Using log_epsilon=1.0 with sub-unit data "
-                "compresses most of the distribution and will produce inaccurate densities.",
+                f"y ({_y_min:.4g}). The log-likelihood will be silently wrong because "
+                "log(y + log_epsilon) no longer approximates log(y) for these values. "
+                f"Suggested fix: set log_epsilon={_suggested:.2g} (or log_epsilon=1e-6 "
+                "for very small losses). Using a log_epsilon larger than your smallest "
+                "loss compresses most of the distribution near zero and produces "
+                "inaccurate densities.",
                 UserWarning,
                 stacklevel=2,
             )

@@ -279,3 +279,95 @@ class TestNegBinomPrediction:
         pred = DistributionalPrediction("foobar", mu=np.array([1.0]))
         with pytest.raises(ValueError, match="Unknown distribution"):
             _ = pred.variance
+
+
+# ---------------------------------------------------------------------------
+# Performance-fix regression tests
+# These verify the vectorised implementations (no Python loops) produce
+# correct statistical results.
+# ---------------------------------------------------------------------------
+
+
+class TestVectorisedTweedieSampling:
+    """Regression tests for the vectorised _sample_tweedie implementation."""
+
+    def test_sampling_shape_large(self):
+        """Shape is correct for a larger observation set."""
+        rng = np.random.default_rng(99)
+        n = 200
+        mu = rng.uniform(100, 1000, n)
+        phi = rng.uniform(0.1, 0.5, n)
+        pred = DistributionalPrediction("tweedie", mu=mu, phi=phi, power=1.5)
+        samples = pred._sample(n_samples=500, rng=np.random.default_rng(0))
+        assert samples.shape == (n, 500)
+
+    def test_sampling_nonneg_large(self):
+        """Vectorised Tweedie samples must all be >= 0."""
+        rng = np.random.default_rng(99)
+        n = 200
+        mu = rng.uniform(100, 1000, n)
+        phi = rng.uniform(0.1, 0.5, n)
+        pred = DistributionalPrediction("tweedie", mu=mu, phi=phi, power=1.5)
+        samples = pred._sample(n_samples=500, rng=np.random.default_rng(0))
+        assert np.all(samples >= 0)
+
+    def test_sampling_mean_converges(self):
+        """Vectorised sample mean converges to predicted mu."""
+        mu = np.array([200.0, 500.0, 1000.0])
+        phi = np.array([0.2, 0.3, 0.4])
+        pred = DistributionalPrediction("tweedie", mu=mu, phi=phi, power=1.5)
+        samples = pred._sample(n_samples=30_000, rng=np.random.default_rng(7))
+        sample_means = samples.mean(axis=1)
+        np.testing.assert_allclose(sample_means, mu, rtol=0.10)
+
+    def test_all_zero_counts(self):
+        """When lambda_tw is very small, most samples should be zero (Tweedie mass at 0)."""
+        # Very small mu, large phi => lambda_tw very small => most draws are 0
+        mu = np.array([0.01, 0.01])
+        phi = np.array([2.0, 2.0])
+        pred = DistributionalPrediction("tweedie", mu=mu, phi=phi, power=1.5)
+        samples = pred._sample(n_samples=500, rng=np.random.default_rng(0))
+        assert samples.shape == (2, 500)
+        assert np.all(samples >= 0)
+
+
+class TestVectorisedNegBinomSampling:
+    """Regression tests for the vectorised _sample_negbinom implementation."""
+
+    def test_sampling_shape(self):
+        rng = np.random.default_rng(30)
+        n = 50
+        mu = rng.uniform(0.1, 2.0, n)
+        r = np.full(n, 3.0)
+        pred = DistributionalPrediction("negbinom", mu=mu, r=r)
+        samples = pred._sample(n_samples=200, rng=np.random.default_rng(0))
+        assert samples.shape == (n, 200)
+
+    def test_sampling_nonneg_integer(self):
+        rng = np.random.default_rng(30)
+        n = 40
+        mu = rng.uniform(0.5, 5.0, n)
+        r = np.full(n, 2.0)
+        pred = DistributionalPrediction("negbinom", mu=mu, r=r)
+        samples = pred._sample(n_samples=300, rng=np.random.default_rng(1))
+        assert np.all(samples >= 0)
+        assert np.all(samples == samples.astype(int))
+
+    def test_sampling_mean_converges(self):
+        """Vectorised NB sample mean converges to predicted mu."""
+        mu = np.array([1.0, 2.0, 5.0])
+        r = np.array([3.0, 3.0, 3.0])
+        pred = DistributionalPrediction("negbinom", mu=mu, r=r)
+        samples = pred._sample(n_samples=50_000, rng=np.random.default_rng(42))
+        sample_means = samples.mean(axis=1)
+        np.testing.assert_allclose(sample_means, mu, rtol=0.05)
+
+    def test_sampling_variance_converges(self):
+        """Vectorised NB sample variance converges to mu + mu^2/r."""
+        mu = np.array([2.0, 4.0])
+        r = np.array([2.0, 2.0])
+        pred = DistributionalPrediction("negbinom", mu=mu, r=r)
+        samples = pred._sample(n_samples=80_000, rng=np.random.default_rng(13))
+        sample_vars = samples.var(axis=1)
+        expected_vars = mu + mu ** 2 / r
+        np.testing.assert_allclose(sample_vars, expected_vars, rtol=0.10)

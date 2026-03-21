@@ -562,3 +562,60 @@ class TestPolarsInput:
         model.fit(X_pl, y_pl)
         pred = model.predict_density(X_pl[:10])
         assert pred.cdes.shape[0] == 10
+
+
+# ---------------------------------------------------------------------------
+# log_epsilon warning tests (Bug 3 fix)
+# ---------------------------------------------------------------------------
+
+
+class TestLogEpsilonWarning:
+    """
+    Verify that FlexCodeDensity emits a UserWarning when log_epsilon is
+    larger than the minimum observed y. This guards against silently wrong
+    log-likelihoods when losses are in sub-unit scale (pence, cents, [0,1]).
+    """
+
+    def test_warns_when_y_min_lt_log_epsilon(self):
+        """Fitting on y values < log_epsilon should trigger a UserWarning."""
+        rng = np.random.default_rng(0)
+        # y in [0.001, 0.1] — much smaller than the default log_epsilon=1.0
+        y = rng.uniform(0.001, 0.1, 100)
+        X = rng.normal(size=(100, 2))
+        model = FlexCodeDensity(
+            max_basis=3,
+            log_epsilon=1.0,  # default — will be larger than y.min()
+            catboost_params={"iterations": 5},
+        )
+        with pytest.warns(UserWarning, match="log_epsilon"):
+            model.fit(X, y)
+
+    def test_warning_suggests_1e6(self):
+        """Warning message should reference 1e-6 as a suggested value."""
+        rng = np.random.default_rng(1)
+        y = rng.uniform(0.001, 0.1, 80)
+        X = rng.normal(size=(80, 2))
+        model = FlexCodeDensity(
+            max_basis=3,
+            log_epsilon=1.0,
+            catboost_params={"iterations": 5},
+        )
+        with pytest.warns(UserWarning, match="1e-6"):
+            model.fit(X, y)
+
+    def test_no_warning_when_log_epsilon_appropriate(self):
+        """No warning when log_epsilon is well below y.min()."""
+        rng = np.random.default_rng(2)
+        # y in [100, 5000] — log_epsilon=1.0 is safely below y.min()
+        y = rng.uniform(100.0, 5000.0, 80)
+        X = rng.normal(size=(80, 2))
+        model = FlexCodeDensity(
+            max_basis=3,
+            log_epsilon=1.0,
+            catboost_params={"iterations": 5},
+        )
+        import warnings as _warnings
+        with _warnings.catch_warnings():
+            _warnings.simplefilter("error", UserWarning)
+            # Should not raise — log_epsilon < y.min()
+            model.fit(X, y)
