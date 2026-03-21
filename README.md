@@ -53,6 +53,8 @@ pip install insurance-distributional
 
 Requires CatBoost, NumPy, Polars, SciPy.
 
+> 💬 Questions or feedback? Start a [Discussion](https://github.com/burning-cost/insurance-distributional/discussions). Found it useful? A ⭐ helps others find it.
+
 ---
 
 ## Quick start
