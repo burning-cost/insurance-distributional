@@ -73,7 +73,12 @@ from .scoring import (
 from .tweedie import TweedieGBM
 from .zip import ZIPGBM
 
-__version__ = "0.2.0"
+from importlib.metadata import version, PackageNotFoundError
+
+try:
+    __version__ = version("insurance-distributional")
+except PackageNotFoundError:
+    __version__ = "0.0.0"  # not installed
 
 __all__ = [
     # Parametric models
