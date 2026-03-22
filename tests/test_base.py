@@ -145,3 +145,31 @@ class TestInputValidation:
 
         with pytest.raises(ValueError, match="power"):
             TweedieGBM(power=2.5)
+
+
+class TestNCyclesValidation:
+    """P1: n_cycles must be >= 1."""
+
+    def test_n_cycles_zero_raises(self):
+        from insurance_distributional import TweedieGBM
+        rng = np.random.default_rng(1)
+        X = rng.standard_normal((50, 3))
+        y = rng.gamma(2.0, 0.5, 50)
+        model = TweedieGBM(n_cycles=0)
+        with pytest.raises(ValueError, match="n_cycles must be >= 1"):
+            model.fit(X, y)
+
+    def test_n_cycles_negative_raises(self):
+        from insurance_distributional import TweedieGBM
+        rng = np.random.default_rng(2)
+        X = rng.standard_normal((50, 3))
+        y = rng.gamma(2.0, 0.5, 50)
+        model = TweedieGBM(n_cycles=-1)
+        with pytest.raises(ValueError, match="n_cycles must be >= 1"):
+            model.fit(X, y)
+
+    def test_n_cycles_one_accepted(self):
+        """n_cycles=1 is valid and should not raise."""
+        from insurance_distributional import TweedieGBM
+        model = TweedieGBM(n_cycles=1)
+        assert model.n_cycles == 1

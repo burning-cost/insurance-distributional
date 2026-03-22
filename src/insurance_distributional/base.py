@@ -111,9 +111,9 @@ class DistributionalGBM(ABC):
     Parameters
     ----------
     n_cycles : int
-        Number of coordinate descent cycles. Default 1. More cycles rarely
-        help for well-specified models — the residual fitting step captures
-        most of the dispersion signal in the first pass.
+        Number of coordinate descent cycles. Must be >= 1. Default 1. More
+        cycles rarely help for well-specified models — the residual fitting step
+        captures most of the dispersion signal in the first pass.
     cat_features : list of int or str, optional
         Categorical feature indices or names. Passed through to CatBoost.
     catboost_params_mu : dict, optional
@@ -167,6 +167,13 @@ class DistributionalGBM(ABC):
         -------
         self
         """
+        # P1 validation: n_cycles must be at least 1
+        if self.n_cycles < 1:
+            raise ValueError(
+                f"n_cycles must be >= 1, got {self.n_cycles}. "
+                "A model with 0 boosting cycles produces no fit — use n_cycles=1."
+            )
+
         X_np = _to_numpy(X)
         y_np = _to_1d(y)
         n = len(y_np)

@@ -28,6 +28,18 @@ For the joint estimation approach, see So & Valdez (2024, arXiv 2406.16206).
 Note on lambda vs mu: internally we track lambda (the Poisson rate). The
 predicted mean is mu = (1-pi)*lambda. The DistributionalPrediction.mu property
 returns the observable mean (1-pi)*lambda, not lambda itself.
+
+Baseline handling (mirrors TweedieGBM convention):
+  CatBoost Poisson loss uses a log link internally. When training with a Pool
+  that has a baseline=b, CatBoost minimises Poisson(y, exp(b + f(x))). The model
+  stores only f(x) (the tree contributions); model.predict(X) returns exp(f(x))
+  not exp(b + f(x)). The baseline must be re-applied at inference time.
+
+  For ZIPGBM:
+  - lambda model: training baseline = log(exposure) + log(lam_init) for cycle 0,
+    log(lam_prev) + log(exposure) for subsequent cycles.
+    At inference, call _predict_catboost with baseline=log(exposure) to get the
+    per-unit-exposure Poisson rate.
 """
 
 from __future__ import annotations
@@ -89,7 +101,7 @@ class ZIPGBM(DistributionalGBM):
     Parameters
     ----------
     n_cycles : int
-        Coordinate descent cycles. Default 1.
+        Coordinate descent cycles. Must be >= 1. Default 1.
     cat_features : list, optional
     catboost_params_mu : dict, optional
         Parameters for the lambda (Poisson) model.
@@ -228,7 +240,12 @@ class ZIPGBM(DistributionalGBM):
         self._model_lambda = self._fit_catboost(
             X, y, lam_params, baseline=baseline_lam, sample_weight=w_lambda
         )
-        lam_hat = self._model_lambda.predict(X)
+        # P1 fix: use _predict_catboost with exposure baseline so the Poisson
+        # rate is correctly adjusted for exposure. model.predict(X) returns only
+        # exp(tree_output); the exposure offset must be re-applied at inference.
+        lam_hat = self._predict_catboost(
+            self._model_lambda, X, baseline=np.log(exposure)
+        )
         lam_hat = np.clip(lam_hat, 1e-6, None)
         params["lam"] = lam_hat
 
@@ -296,7 +313,12 @@ class ZIPGBM(DistributionalGBM):
     def _predict_params(
         self, X: np.ndarray, exposure: np.ndarray
     ) -> Dict[str, np.ndarray]:
-        lam_hat = np.clip(self._model_lambda.predict(X), 1e-6, None)
+        # P1 fix: use _predict_catboost with exposure baseline so the lambda
+        # estimate correctly accounts for exposure at inference time.
+        lam_hat = np.clip(
+            self._predict_catboost(self._model_lambda, X, baseline=np.log(exposure)),
+            1e-6, None
+        )
         pi_hat = np.clip(
             self._predict_catboost_classifier(self._model_pi, X),
             1e-6, 1 - 1e-6
@@ -332,7 +354,12 @@ class ZIPGBM(DistributionalGBM):
         from .base import _to_numpy
         self._check_is_fitted()
         X_np = _to_numpy(X)
-        lam = np.clip(self._model_lambda.predict(X_np), 1e-6, None)
+        n = len(X_np)
+        exp_np = _to_1d(exposure) if exposure is not None else np.ones(n)
+        lam = np.clip(
+            self._predict_catboost(self._model_lambda, X_np, baseline=np.log(exp_np)),
+            1e-6, None
+        )
         return lam
 
     def __repr__(self) -> str:
