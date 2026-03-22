@@ -3,7 +3,7 @@ name = "insurance-distributional"
 version = "0.2.0"
 description = "Distributional GBM for insurance pricing — Tweedie, ZIP, Gamma, Negative Binomial with CatBoost"
 readme = "README.md"
-license = { text = "MIT" }
+license = "MIT"
 authors = [
     { name = "Burning Cost", email = "pricing.frontier@gmail.com" }
 ]
