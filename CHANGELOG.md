@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.3.0] - 2026-03-28
+
+### Added
+- ZeroInflatedTweedieGBM: first open-source implementation of So & Valdez (2024) ASTIN Best Paper Scenario 2
+- Two-stage ZI-Tweedie: CatBoost classifier for P(Y=0) + CatBoost Tweedie regressor for E[Y|Y>0]
+- predict_components() returns zero_prob, severity_mean, combined_mean separately
+- 63-test suite covering fit/predict, components, exposure, sample_weight, pickle, edge cases
+- Databricks demo notebook: 02_zero_inflated_tweedie_demo.py
+
+## [0.2.1] - 2026-03-23
+
+### Fixed
+- Bumped numpy minimum version from >=1.24 to >=1.25 to ensure compatibility with scipy's use of numpy.exceptions (added in numpy 1.25)
+
 ## v0.2.0 (2026-03-21)
 - Add cross-links to related libraries in README
 - docs: replace pip install with uv add in README
@@ -26,4 +40,3 @@
 - Fix P0/P1 bugs: exposure prediction, ZIPGBM lambda init, NegBinom gradient
 - Add benchmark: GammaGBM (per-risk phi) vs constant-phi Gamma GLM
 - docs: add Databricks notebook link
-
