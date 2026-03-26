@@ -8,3 +8,11 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Test artifacts
+.coverage
+htmlcov/
+.pytest_cache/
+
+# Model artifacts
+catboost_info/
