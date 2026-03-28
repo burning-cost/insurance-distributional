@@ -28,6 +28,16 @@ Quick start:
     model.crps(X_test, y_test)
     model.log_score(X_test, y_test)
 
+    # Zero-inflated Tweedie (So & Valdez Scenario 2)
+    from insurance_distributional import ZeroInflatedTweedieGBM
+    zi = ZeroInflatedTweedieGBM(power=1.5)
+    zi.fit(X_train, y_train, exposure=exposure_train)
+    mu_hat = zi.predict(X_test)
+    components = zi.predict_components(X_test)
+    # components['zero_prob']     -- P(Y=0 | x) per risk
+    # components['severity_mean'] -- E[Y | Y>0, x] per risk
+    # components['combined_mean'] -- E[Y | x] = (1-pi) * mu_sev
+
     # Nonparametric per-risk XL layer pricing
     from insurance_distributional import FlexCodeDensity
     fc = FlexCodeDensity(max_basis=30)
@@ -35,11 +45,12 @@ Quick start:
     ev = fc.price_layer(X_test, attachment=500.0, limit=1000.0)
 
 Distributions:
-    TweedieGBM      Compound Poisson-Gamma. Motor/home pure premium. (mu, phi)
-    GammaGBM        Gamma severity. Single-peril severity models. (mu, phi)
-    ZIPGBM          Zero-Inflated Poisson. Pet/travel/breakdown frequency. (lambda, pi)
-    NegBinomialGBM  Negative Binomial counts. Overdispersed frequency. (mu, r)
-    FlexCodeDensity Nonparametric CDE via cosine basis + CatBoost. XL pricing.
+    TweedieGBM              Compound Poisson-Gamma. Motor/home pure premium. (mu, phi)
+    GammaGBM                Gamma severity. Single-peril severity models. (mu, phi)
+    ZIPGBM                  Zero-Inflated Poisson. Pet/travel/breakdown frequency. (lambda, pi)
+    NegBinomialGBM          Negative Binomial counts. Overdispersed frequency. (mu, r)
+    ZeroInflatedTweedieGBM  ZI-Tweedie (So & Valdez 2024 Scenario 2). (pi, mu_sev)
+    FlexCodeDensity         Nonparametric CDE via cosine basis + CatBoost. XL pricing.
 
 Reference:
     So & Valdez (2024). Zero-Inflated Tweedie Boosted Trees with CatBoost
@@ -72,6 +83,7 @@ from .scoring import (
 )
 from .tweedie import TweedieGBM
 from .zip import ZIPGBM
+from .zi_tweedie import ZeroInflatedTweedieGBM
 
 from importlib.metadata import version, PackageNotFoundError
 
@@ -86,6 +98,7 @@ __all__ = [
     "GammaGBM",
     "ZIPGBM",
     "NegBinomialGBM",
+    "ZeroInflatedTweedieGBM",
     # Nonparametric CDE
     "FlexCodeDensity",
     "FlexCodePrediction",
