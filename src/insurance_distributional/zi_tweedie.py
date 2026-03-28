@@ -225,11 +225,21 @@ class ZeroInflatedTweedieGBM:
         # --- Stage 1: Zero classifier ---
         logger.debug("Stage 1: fitting zero classifier (n=%d)", n)
         zero_labels = (y_np == 0).astype(np.float64)
-        zero_params = self._build_zero_params()
 
-        self._model_zero = self._fit_classifier(
-            X_np, zero_labels, zero_params, sample_weight=sw_np
-        )
+        if n_zero == 0:
+            # No zeros — skip classifier, π̂ = 0 everywhere
+            logger.info("No zero observations; skipping classifier (π̂ = 0)")
+            self._model_zero = None
+            self._constant_zero_prob = 0.0
+        elif n_nonzero == 0:
+            # All zeros — shouldn't reach here (caught by n_nonzero < 10)
+            raise ValueError("All observations are zero")
+        else:
+            zero_params = self._build_zero_params()
+            self._model_zero = self._fit_classifier(
+                X_np, zero_labels, zero_params, sample_weight=sw_np
+            )
+            self._constant_zero_prob = None
 
         # --- Stage 2: Tweedie severity on y > 0 only ---
         logger.debug("Stage 2: fitting Tweedie severity (n=%d)", n_nonzero)
@@ -318,8 +328,11 @@ class ZeroInflatedTweedieGBM:
             exp_np = np.ones(n, dtype=np.float64)
 
         # Stage 1: zero probability
-        zero_prob = self._predict_classifier(self._model_zero, X_np)
-        zero_prob = np.clip(zero_prob, 0.0, 1.0)
+        if self._model_zero is None:
+            zero_prob = np.full(n, self._constant_zero_prob, dtype=np.float64)
+        else:
+            zero_prob = self._predict_classifier(self._model_zero, X_np)
+            zero_prob = np.clip(zero_prob, 0.0, 1.0)
 
         # Stage 2: severity mean with exposure offset
         baseline_sev = np.log(exp_np) + np.log(self._severity_init)
