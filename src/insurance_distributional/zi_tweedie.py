@@ -369,9 +369,13 @@ class ZeroInflatedTweedieGBM:
         """
         self._check_is_fitted()
         X_np = _to_numpy(X)
-        zero_prob = np.clip(
-            self._predict_classifier(self._model_zero, X_np), 0.0, 1.0
-        )
+        n = len(X_np)
+        if self._model_zero is None:
+            zero_prob = np.full(n, self._constant_zero_prob, dtype=np.float64)
+        else:
+            zero_prob = np.clip(
+                self._predict_classifier(self._model_zero, X_np), 0.0, 1.0
+            )
         return np.column_stack([1.0 - zero_prob, zero_prob])
 
     def score(
