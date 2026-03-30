@@ -310,6 +310,51 @@ class DistributionalGBM(ABC):
         term2 = 0.5 * np.abs(samples[:, :half] - samples[:, half:2*half]).mean(axis=1)
         return float(np.mean(term1 - term2))
 
+    def tw_crps(
+        self,
+        X: Union[np.ndarray, pl.DataFrame],
+        y: Union[np.ndarray, pl.Series],
+        threshold: float,
+        exposure: Optional[Union[np.ndarray, pl.Series]] = None,
+        n_samples: int = 2000,
+        seed: int = 42,
+    ) -> float:
+        """
+        Mean threshold-weighted CRPS above threshold. Lower is better.
+
+        Convenience wrapper around scoring.tw_crps(). Focuses the proper
+        score on the upper tail of the loss distribution, making it sensitive
+        to how well the model captures large-loss behaviour. Particularly
+        useful for:
+        - Reinsurance pricing (XL layer attachment/limit decisions)
+        - Capital modelling (VaR/TVaR calibration)
+        - Comparing models that agree on the mean but differ in the tail
+
+        At threshold=0 the result should match model.crps() within MC noise
+        (the chaining function phi(z)=max(z,0) is the identity for non-negative
+        losses).
+
+        Parameters
+        ----------
+        X, y, exposure : as for fit()
+        threshold : float
+            Tail threshold. Only variation above this level contributes.
+            A natural choice is the 80th or 90th percentile of y_train.
+        n_samples : int
+            MC samples per observation. Default 2000 gives <2% relative error.
+        seed : int
+
+        Returns
+        -------
+        float
+            Mean twCRPS across all observations.
+        """
+        self._check_is_fitted()
+        from .scoring import tw_crps as _tw_crps
+        pred = self.predict(X, exposure)
+        y_np = _to_1d(y)
+        return _tw_crps(y_np, pred, threshold, n_samples=n_samples, seed=seed)
+
     # -------------------------------------------------------------------------
     # Abstract methods — subclasses must implement
     # -------------------------------------------------------------------------

@@ -79,6 +79,8 @@ from .scoring import (
     pearson_residuals,
     pit_values,
     poisson_deviance,
+    tw_crps,
+    tw_crps_profile,
     tweedie_deviance,
 )
 from .tweedie import TweedieGBM
@@ -114,4 +116,6 @@ __all__ = [
     "pit_values",
     "pearson_residuals",
     "gini_index",
+    "tw_crps",
+    "tw_crps_profile",
 ]

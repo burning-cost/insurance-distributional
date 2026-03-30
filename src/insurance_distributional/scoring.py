@@ -13,6 +13,8 @@ Functions here:
 - pit_histogram: probability integral transform calibration check
 - dispersion_calibration_plot: predicted phi vs squared Pearson residuals
 - gini_index: discrimination power for pricing models
+- tw_crps: threshold-weighted CRPS for tail-focused evaluation
+- tw_crps_profile: twCRPS across a range of thresholds
 
 The CRPS is on the DistributionalPrediction class itself (it needs samples
 from the distribution, so it belongs there).
@@ -384,3 +386,134 @@ def cde_loss(
     term2 = float(np.mean(term2_vals))
 
     return term1 - 2.0 * term2
+
+
+# ---------------------------------------------------------------------------
+# Threshold-weighted CRPS (Gneiting & Ranjan 2011)
+# ---------------------------------------------------------------------------
+
+
+def tw_crps(
+    y: np.ndarray,
+    pred,  # DistributionalPrediction
+    threshold: float,
+    n_samples: int = 2000,
+    seed: int = 42,
+) -> float:
+    """
+    Mean threshold-weighted CRPS above ``threshold``. Lower is better.
+
+    The twCRPS uses the chaining function phi(z) = max(z, threshold) from
+    Gneiting & Ranjan (2011). This focuses the score on the upper tail —
+    the part of the distribution that matters most for reinsurance pricing,
+    capital modelling, and large-loss retention decisions.
+
+    At threshold=0 the chaining function is the identity (for non-negative
+    losses) and twCRPS reduces to the standard CRPS.
+
+    Implementation uses the energy-score MC estimator on the clipped values:
+        twCRPS(F, y; t) ≈ E_F[|phi(X) - phi(y)|] - 0.5 * E_F[|phi(X) - phi(X')|]
+    where phi(z) = max(z, t) and X, X' are independent draws from F.
+
+    Parameters
+    ----------
+    y : array-like
+        Observed values. Shape (n,).
+    pred : DistributionalPrediction
+        Fitted distributional prediction (n rows, any supported distribution).
+    threshold : float
+        Tail threshold. Observations and samples below this value are clipped
+        to it, so only variation above the threshold contributes to the score.
+    n_samples : int
+        MC samples per observation. Default 2000 gives <2% relative error.
+    seed : int
+        Random seed for reproducibility.
+
+    Returns
+    -------
+    float
+        Mean twCRPS across all observations.
+
+    References
+    ----------
+    Gneiting, T. & Ranjan, R. (2011). Comparing density forecasts using
+    threshold- and quantile-weighted scoring rules. Journal of Business &
+    Economic Statistics, 29(3):411-422.
+    """
+    rng = np.random.default_rng(seed)
+    samples = pred._sample(n_samples=n_samples, rng=rng)  # (n, n_samples)
+    y_arr = np.asarray(y, dtype=np.float64)
+
+    # Apply chaining function phi(z) = max(z, threshold)
+    phi_samples = np.maximum(samples, threshold)
+    phi_y = np.maximum(y_arr, threshold)
+
+    # Standard CRPS energy-score formula on clipped values
+    term1 = np.abs(phi_samples - phi_y[:, None]).mean(axis=1)
+    half = n_samples // 2
+    term2 = 0.5 * np.abs(phi_samples[:, :half] - phi_samples[:, half:2 * half]).mean(axis=1)
+    return float(np.mean(term1 - term2))
+
+
+def tw_crps_profile(
+    y: np.ndarray,
+    pred,  # DistributionalPrediction
+    thresholds: np.ndarray,
+    n_samples: int = 2000,
+    seed: int = 42,
+) -> dict:
+    """
+    twCRPS at each threshold. Returns {threshold: twcrps_value}.
+
+    Draws samples once and loops over thresholds applying the chaining
+    function — more efficient than calling tw_crps() separately for each
+    threshold.
+
+    Use this to understand where in the loss distribution your model performs
+    well or poorly. A model with good overall CRPS may have poor twCRPS at
+    high thresholds (inadequate tail calibration), which matters for XL
+    pricing and capital modelling.
+
+    Parameters
+    ----------
+    y : array-like
+        Observed values. Shape (n,).
+    pred : DistributionalPrediction
+        Fitted distributional prediction.
+    thresholds : array-like
+        Sequence of threshold values to evaluate. Typically a range from 0
+        to a high quantile of y, e.g. np.linspace(0, np.quantile(y, 0.99)).
+    n_samples : int
+        MC samples per observation. Shared across all thresholds.
+    seed : int
+        Random seed for reproducibility.
+
+    Returns
+    -------
+    dict
+        {threshold (float): twcrps_value (float)} for each threshold.
+
+    References
+    ----------
+    Gneiting, T. & Ranjan, R. (2011). Comparing density forecasts using
+    threshold- and quantile-weighted scoring rules. Journal of Business &
+    Economic Statistics, 29(3):411-422.
+    """
+    rng = np.random.default_rng(seed)
+    samples = pred._sample(n_samples=n_samples, rng=rng)  # (n, n_samples)
+    y_arr = np.asarray(y, dtype=np.float64)
+    thresholds_arr = np.asarray(thresholds, dtype=np.float64)
+
+    half = n_samples // 2
+    result = {}
+
+    for t in thresholds_arr:
+        t_float = float(t)
+        phi_samples = np.maximum(samples, t_float)
+        phi_y = np.maximum(y_arr, t_float)
+
+        term1 = np.abs(phi_samples - phi_y[:, None]).mean(axis=1)
+        term2 = 0.5 * np.abs(phi_samples[:, :half] - phi_samples[:, half:2 * half]).mean(axis=1)
+        result[t_float] = float(np.mean(term1 - term2))
+
+    return result
