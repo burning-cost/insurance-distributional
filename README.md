@@ -456,6 +456,38 @@ FlexCodeDensity params:
 **Limitation:** Does not extrapolate beyond the training data range. If your XL layer extends beyond the historical maximum loss, use `EQRNModel` from `insurance_quantile.eqrn` for a GPD tail that extrapolates. The two can be spliced: FlexCode for the body of the distribution, GPD for the extreme tail.
 
 
+## NeuralGaussianMixture
+
+`NeuralGaussianMixture` trains a feedforward network that maps risk features to a K-component Gaussian mixture per observation, using a hybrid NLL + energy score loss. The result is a full conditional distribution per risk — not just E[Y|x] — without fixing a parametric shape like Gamma or Tweedie.
+
+The energy score component (Gneiting & Raftery 2007, analytic formula from Yang et al. 2026 arXiv:2603.27672) avoids Monte Carlo at training time. This matters on constrained compute: the analytic O(K²) formula computes gradients stably on CPU.
+
+Use this when the distributional GBMs above are not flexible enough — for example, motor severity that has a genuine bimodal shape (attritional versus large BI), where a Tweedie or Gamma GBM imposes a unimodal shape by construction.
+
+```python
+import numpy as np
+from insurance_distributional import NeuralGaussianMixture
+
+rng = np.random.default_rng(42)
+n = 3_000
+X = np.column_stack([
+    rng.integers(0, 15, n).astype(float),  # vehicle_age
+    rng.integers(18, 75, n).astype(float), # driver_age
+    rng.integers(0, 5, n).astype(float),   # ncd_years
+])
+# Lognormal severity with vehicle-age-dependent spread
+y = rng.lognormal(mean=7.5, sigma=0.4 + 0.02 * X[:, 0])
+
+model = NeuralGaussianMixture(n_components=3, log_transform=True, epochs=150)
+model.fit(X[:2400], y[:2400])
+
+pred = model.predict(X[2400:])
+pred.mean           # E[Y|X]
+pred.volatility_score()  # CoV = SD/mean per risk, for safety loading
+pred.quantile(0.95)      # 95th percentile per risk
+pred.price_layer(attachment=50_000, limit=200_000)  # XL layer expected loss
+```
+
 ## References
 
 - So & Valdez (2024). *Zero-Inflated Tweedie Boosted Trees with CatBoost for Insurance Loss Analytics*. Applied Soft Computing. doi:10.1016/j.asoc.2025.113226. arXiv 2406.16206. **ASTIN Best Paper 2024.**
