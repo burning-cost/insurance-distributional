@@ -1,6 +1,6 @@
 [project]
 name = "insurance-distributional"
-version = "0.3.1"
+version = "0.3.2"
 description = "Distributional GBM for insurance pricing — Tweedie, ZIP, Gamma, Negative Binomial with CatBoost"
 readme = "README.md"
 license = "MIT"
@@ -27,6 +27,7 @@ dependencies = [
 
 [project.optional-dependencies]
 plots = ["matplotlib>=3.6"]
+gar = ["torch>=2.0"]
 dev = ["pytest>=7.0", "pytest-cov", "numpy>=1.25", "polars>=1.0", "pdoc>=14.0.0"]
 
 [project.urls]
