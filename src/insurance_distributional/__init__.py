@@ -103,7 +103,7 @@ from .zi_tweedie import ZeroInflatedTweedieGBM
 # Install with: pip install insurance-distributional[gar]
 try:
     from .gar import GARScenarioGenerator
-except ImportError:
+except (ImportError, NameError):
     # torch not installed; GARScenarioGenerator not available at top level.
     pass
 
@@ -111,7 +111,7 @@ except ImportError:
 # Install with: pip install insurance-distributional[neural]
 try:
     from .neural_gmm import NeuralGaussianMixture, GMMPrediction
-except ImportError:
+except (ImportError, NameError):
     # torch not installed; NeuralGaussianMixture not available at top level.
     pass
 

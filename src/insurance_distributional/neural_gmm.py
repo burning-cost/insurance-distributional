@@ -53,6 +53,31 @@ try:
 except ImportError:  # pragma: no cover
     _TORCH_AVAILABLE = False
 
+    # Provide stub so class definitions using nn.Module don't raise NameError
+    # at import time when torch is absent.
+    class _NNStub:
+        class Module:
+            pass
+
+        class Sequential:
+            pass
+
+        class Linear:
+            pass
+
+        class ReLU:
+            pass
+
+        class Softmax:
+            pass
+
+        class utils:
+            @staticmethod
+            def clip_grad_norm_(*args, **kwargs):
+                pass
+
+    nn = _NNStub()  # type: ignore[assignment]
+
 
 def _require_torch() -> None:
     if not _TORCH_AVAILABLE:
