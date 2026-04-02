@@ -1,6 +1,6 @@
 [project]
 name = "insurance-distributional"
-version = "0.3.2"
+version = "0.4.0"
 description = "Distributional GBM for insurance pricing — Tweedie, ZIP, Gamma, Negative Binomial with CatBoost"
 readme = "README.md"
 license = "MIT"
@@ -8,7 +8,7 @@ authors = [
     { name = "Burning Cost", email = "pricing.frontier@gmail.com" }
 ]
 requires-python = ">=3.10"
-keywords = ["insurance", "actuarial", "gradient-boosting", "distributional", "tweedie", "catboost"]
+keywords = ["insurance", "actuarial", "gradient-boosting", "distributional", "tweedie", "catboost", "neural-network", "gaussian-mixture"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Financial and Insurance Industry",
@@ -28,6 +28,7 @@ dependencies = [
 [project.optional-dependencies]
 plots = ["matplotlib>=3.6"]
 gar = ["torch>=2.0"]
+neural = ["torch>=2.0"]
 dev = ["pytest>=7.0", "pytest-cov", "numpy>=1.25", "polars>=1.0", "pdoc>=14.0.0"]
 
 [project.urls]

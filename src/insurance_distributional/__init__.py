@@ -107,6 +107,14 @@ except ImportError:
     # torch not installed; GARScenarioGenerator not available at top level.
     pass
 
+# Neural GMM — optional dependency (torch required).
+# Install with: pip install insurance-distributional[neural]
+try:
+    from .neural_gmm import NeuralGaussianMixture, GMMPrediction
+except ImportError:
+    # torch not installed; NeuralGaussianMixture not available at top level.
+    pass
+
 from importlib.metadata import version, PackageNotFoundError
 
 try:
@@ -140,4 +148,7 @@ __all__ = [
     "tw_crps_profile",
     # GAR scenario generator (optional: requires torch)
     "GARScenarioGenerator",
+    # Neural GMM (optional: requires torch)
+    "NeuralGaussianMixture",
+    "GMMPrediction",
 ]
