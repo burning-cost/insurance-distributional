@@ -597,6 +597,7 @@ class NeuralGaussianMixture:
                 pi, mu, sigma2 = net(batch_X)
                 loss = self._hybrid_loss(pi, mu, sigma2, batch_y)
                 loss.backward()
+                nn.utils.clip_grad_norm_(net.parameters(), 1.0)
                 opt.step()
                 epoch_loss += loss.item()
                 n_batches += 1
@@ -655,10 +656,21 @@ class NeuralGaussianMixture:
             X_t = torch.tensor(X_arr, dtype=torch.float32)
             pi, mu, sigma2 = self._net(X_t)
 
+        weights_np = pi.numpy()
+        means_np = mu.numpy()
+        vars_np = sigma2.numpy()
+
+        # Sort components by mean ascending so component 0 is always the attritional mode.
+        # This ensures consistent component interpretation across runs and observations.
+        sort_idx = np.argsort(means_np, axis=1)  # (m, K)
+        weights_np = np.take_along_axis(weights_np, sort_idx, axis=1)
+        means_np   = np.take_along_axis(means_np, sort_idx, axis=1)
+        vars_np    = np.take_along_axis(vars_np, sort_idx, axis=1)
+
         return GMMPrediction(
-            weights=pi.numpy(),
-            means=mu.numpy(),
-            vars=sigma2.numpy(),
+            weights=weights_np,
+            means=means_np,
+            vars=vars_np,
             log_transform=self.log_transform,
         )
 
