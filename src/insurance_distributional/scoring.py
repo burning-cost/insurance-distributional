@@ -316,9 +316,11 @@ def gini_index(
     if total_y == 0:
         return 0.0
 
-    # Normalise to [0, 1]
-    x_lorenz = cum_w / total_w
-    y_lorenz = cum_y / total_y
+    # Normalise to [0, 1] and prepend origin so the trapezoid integrates
+    # from (0, 0) — without this, single-obs cases and perfectly uniform y
+    # give wrong AUC because the curve starts at the first data point, not 0.
+    x_lorenz = np.concatenate([[0.0], cum_w / total_w])
+    y_lorenz = np.concatenate([[0.0], cum_y / total_y])
 
     # Area under Lorenz curve via trapezoid rule
     auc = float(np.trapezoid(y_lorenz, x_lorenz))
